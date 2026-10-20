@@ -187,7 +187,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.0.0"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
