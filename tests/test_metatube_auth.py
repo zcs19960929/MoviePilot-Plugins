@@ -26,6 +26,7 @@ def load_plugin(version, get):
     path = ROOT / f"plugins.{version}" / "metatubescraper" / "__init__.py"
     spec = importlib.util.spec_from_file_location(f"metatubescraper_{version}", path)
     module = importlib.util.module_from_spec(spec)
+    modules[spec.name] = module
     with patch.dict(sys.modules, modules):
         spec.loader.exec_module(module)
     return module.MetaTubeScraper()

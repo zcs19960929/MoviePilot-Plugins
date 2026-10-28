@@ -1,0 +1,2 @@
+p115client==0.0.9.6.5.1; python_version >= "3.12"
+python-concurrenttools==0.1.8; python_version >= "3.12"

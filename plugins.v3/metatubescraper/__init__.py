@@ -15,10 +15,19 @@ import random
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
+from copy import copy
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
+
+from .direct import DirectService
+from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError
+
+try:
+    from starlette.requests import Request
+except ImportError:  # 允许在无 MoviePilot 的离线测试环境加载旧模式
+    Request = Any
 
 try:
     from app.plugins import _PluginBase
@@ -98,8 +107,13 @@ JS_LOAD = """async () => {
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
     const p = (browse_path || '/').trim() || '/';
-    const r = await window.MoviePilotAPI.post('/storage/list', { storage: st, path: p, type: 'dir' });
-    const arr = Array.isArray(r) ? r : ((r && r.data) || []);
+    const r = st === '115_direct'
+      ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(p))
+      : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: p, type: 'dir' });
+    const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
+    if (d && d.code) throw new Error(d.msg || '读取失败');
+    const arr = Array.isArray(d) ? d : ((d && d.data) || []);
+    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
     dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
@@ -114,8 +128,13 @@ JS_ENTER = """async (v) => {
   dir_loading = true; dir_error = '';
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
-    const r = await window.MoviePilotAPI.post('/storage/list', { storage: st, path: path, type: 'dir' });
-    const arr = Array.isArray(r) ? r : ((r && r.data) || []);
+    const r = st === '115_direct'
+      ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(path))
+      : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: path, type: 'dir' });
+    const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
+    if (d && d.code) throw new Error(d.msg || '读取失败');
+    const arr = Array.isArray(d) ? d : ((d && d.data) || []);
+    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
     dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
@@ -124,15 +143,20 @@ JS_ENTER = """async (v) => {
 }"""
 
 JS_UP = """async () => {
+  const st = (storage && storage.value) ? storage.value : (storage || 'local');
   const p = String(browse_path || '/').replace(/\\/+$/, '');
   const i = p.lastIndexOf('/');
-  browse_path = i <= 0 ? '/' : p.slice(0, i);
+  browse_path = st === '115_direct' ? (dir_parent || 'id:0') : (i <= 0 ? '/' : p.slice(0, i));
   pick_dir = null;
   dir_loading = true; dir_error = '';
   try {
-    const st = (storage && storage.value) ? storage.value : (storage || 'local');
-    const r = await window.MoviePilotAPI.post('/storage/list', { storage: st, path: browse_path, type: 'dir' });
-    const arr = Array.isArray(r) ? r : ((r && r.data) || []);
+    const r = st === '115_direct'
+      ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(browse_path))
+      : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: browse_path, type: 'dir' });
+    const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
+    if (d && d.code) throw new Error(d.msg || '读取失败');
+    const arr = Array.isArray(d) ? d : ((d && d.data) || []);
+    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
     dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
   } catch (e) {
     dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
@@ -153,6 +177,15 @@ JS_SELFTEST = """async () => {
       run_msg = '测试失败：' + ((e && e.message) ? e.message : e);
     }
   }
+}"""
+
+JS_CHECK115 = """async () => {
+  run_msg = '正在检查 115 Cookie…';
+  try {
+    const r = await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/check');
+    const d = (r && r.data && r.data.code !== undefined) ? r.data : r;
+    run_msg = (d && d.msg) || '未返回检查结果';
+  } catch (e) { run_msg = '检查失败，请确认已保存 Cookie 和插件依赖可用'; }
 }"""
 
 JS_RUN = """async () => {
@@ -187,7 +220,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.1.0"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -235,14 +268,45 @@ class MetaTubeScraper(_PluginBase):
     _remote_lib_root = ""
     _organize = False
     _trigger_strm = True
+    _cloud115 = None
+    _direct_service = None
+    _direct_lock = threading.RLock()
 
     def init_plugin(self, config: dict = None):
+        if self._running:
+            self._stop_event.set()
+        with self._direct_lock:
+            self.__apply_config(config)
+
+    def __apply_config(self, config: dict = None):
+        # Stop the old background context before replacing credentials/settings.
+        old_client = getattr(self, "_cloud115", None)
+        if old_client is not None:
+            old_client.stop_event.set()
+        previous = getattr(self, "_direct_service", None)
+        if previous is not None:
+            previous.stop_event.set()
+            if not self._running:
+                previous.close()
+            else:
+                if not hasattr(self, "_retired_services"):
+                    self._retired_services = []
+                self._retired_services.append(previous)
+        self._cloud115 = None
+        self._direct_service = None
+        self._stop_event = threading.Event()
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._url = _pick_str(config.get("metatube_url"))
         self._token = _pick_str(config.get("metatube_token"))
         self._providers = _pick_str(config.get("providers"))
-        self._storage = _pick_str(config.get("storage"), "local")
+        self._storage = _pick_str(config.get("storage"), "115_direct" if not config else "local")
+        self._cookie115 = _pick_str(config.get("cookie115"))
+        self._playback_base_url = _pick_str(config.get("playback_base_url")).rstrip("/")
+        try:
+            self._cloud_interval = max(1, float(config.get("cloud_interval", 5)))
+        except (TypeError, ValueError):
+            self._cloud_interval = 5
         dirs = config.get("scan_dirs") or ""
         if isinstance(dirs, list):
             dirs = "\n".join(_pick_str(d) for d in dirs)
@@ -278,6 +342,9 @@ class MetaTubeScraper(_PluginBase):
 
     @property
     def _config_ok(self) -> bool:
+        if self._storage == "115_direct":
+            return bool(self._enabled and self._url and self._scan_dirs and self._cookie115
+                        and self._local_strm_root and self._playback_base_url)
         return bool(self._enabled and self._url and self._scan_dirs)
 
     @property
@@ -286,6 +353,46 @@ class MetaTubeScraper(_PluginBase):
 
     def get_state(self) -> bool:
         return self._config_ok
+
+    def __get_cloud115(self):
+        with self._direct_lock:
+            if self._cloud115 is None:
+                self._cloud115 = Cloud115(self._cookie115, self._cloud_interval, self._stop_event)
+            return self._cloud115
+
+    def __get_direct_service(self):
+        with self._direct_lock:
+            if self._direct_service is None:
+                client = self.__get_cloud115()
+                if not hasattr(self, "get_data_path"):
+                    raise CloudError("宿主无法提供插件数据目录")
+                # Freeze backend credentials and options for this job context;
+                # a later configuration reload stops it instead of mixing servers.
+                backend = copy(self)
+
+                def metadata(number):
+                    result, provider = backend.__search_movie(number)
+                    if not result:
+                        return None
+                    info = backend.__get_movie_info(provider, result.get("id") or "")
+                    if info:
+                        info.setdefault("provider", provider)
+                        info.setdefault("id", result.get("id") or "")
+                    return info
+
+                def artwork(info, kind):
+                    endpoint = "primary" if kind == "poster" else "backdrop"
+                    return backend.__download_image_bytes(
+                        f"/v1/images/{endpoint}/{info.get('provider', '')}/{info.get('id', '')}")
+
+                self._direct_service = DirectService(
+                    client=client, data_dir=Path(self.get_data_path()) / "115_direct",
+                    output_root=self._local_strm_root, playback_base_url=self._playback_base_url,
+                    metadata=metadata, artwork=artwork, build_nfo=backend.__build_nfo,
+                    extract_number=lambda text: backend.__extract_number(text, backend._numeric_ids),
+                    stop_event=self._stop_event, force=self._force,
+                )
+            return self._direct_service
 
     # ---------------- 番号识别 ----------------
 
@@ -356,8 +463,12 @@ class MetaTubeScraper(_PluginBase):
         providers = [p.strip() for p in self._providers.split(",") if p.strip()]
         self._search_notes = []
         for cand in candidates:
+            if self._stop_event.is_set():
+                return None, None
             if providers:
                 for p in providers:
+                    if self._stop_event.is_set():
+                        return None, None
                     data = self.__mt_get("/v1/movies/search",
                                          {"q": cand, "provider": p, "fallback": "true"})
                     results = (data or {}).get("data") or []
@@ -365,6 +476,8 @@ class MetaTubeScraper(_PluginBase):
                         return results[0], p
                     self._search_notes.append(f"{p}:{self._last_status or '空'}")
             # 全局兜底：不指定 provider，走 MetaTube 数据库缓存 + 全部可用源
+            if self._stop_event.is_set():
+                return None, None
             data = self.__mt_get("/v1/movies/search", {"q": cand, "fallback": "true"})
             results = (data or {}).get("data") or []
             if results:
@@ -844,6 +957,13 @@ class MetaTubeScraper(_PluginBase):
                  "notfound": 0, "fail": 0, "time": "", "storage": self._storage}
         try:
             self.info(f"MetaTube 番号刮削开始，存储: {self._storage}，目录: {self._scan_dirs}")
+            if self._storage == "115_direct":
+                result = self.__get_direct_service().run(
+                    self._scan_dirs, recursive=self._scan_mode == "recursive", limit=self._movie_limit)
+                stats.update(result)
+                for message in result.get("errors", []):
+                    self.warn(message)
+                return
             if not self._is_local:
                 self.info("网盘存储模式：目录遍历与写入通过 StorageChain，已按文件写入间隔限速")
             targets = self.__scan_targets()
@@ -859,10 +979,23 @@ class MetaTubeScraper(_PluginBase):
                     break
                 status = self.__process_target(t)
                 stats[status] = stats.get(status, 0) + 1
+        except (AuthenticationError, RiskError) as e:
+            stats.update(getattr(e, "stats", {}))
+            stats["fail"] += 1
+            stats.setdefault("errors", []).append(str(e))
+            self.error(str(e))
         except Exception as e:
+            stats["fail"] += 1
+            if self._storage == "115_direct":
+                message = str(e) if isinstance(e, CloudError) else type(e).__name__
+                stats.setdefault("errors", []).append(message)
             self.error(f"刮削任务异常: {e}")
         finally:
             self._running = False
+            with self._direct_lock:
+                for retired in getattr(self, "_retired_services", []):
+                    retired.close()
+                self._retired_services = []
             from datetime import datetime
             stats["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.save_data("last_run", stats)
@@ -910,7 +1043,54 @@ class MetaTubeScraper(_PluginBase):
             "auth": "bear",
             "summary": "测试数据源",
             "description": "用指定番号逐个测试已配置的数据源，返回每个源的检索结果",
+        }, {
+            "path": "/115/check", "endpoint": self.__api_115_check,
+            "methods": ["GET"], "auth": "bear", "summary": "检查 115 Cookie",
+        }, {
+            "path": "/115/browse", "endpoint": self.__api_115_browse,
+            "methods": ["GET"], "auth": "bear", "summary": "浏览 115 目录",
+        }, {
+            "path": "/redirect_url", "endpoint": self.__api_redirect,
+            "methods": ["GET", "HEAD"], "allow_anonymous": True,
+            "summary": "使用已登记播放标识获取 115 直链",
         }]
+
+    def __api_115_check(self):
+        try:
+            account = self.__get_cloud115().check()
+            return {"code": 0, "msg": "115 Cookie 可用", "account": account}
+        except CloudError as e:
+            return {"code": 400, "msg": str(e)}
+        except Exception:
+            return {"code": 500, "msg": "115 检查失败，请检查依赖和配置"}
+
+    def __api_115_browse(self, path: str = "/"):
+        try:
+            client = self.__get_cloud115()
+            cid = client.resolve_folder(path)
+            current = client.info(cid) if cid != "0" else None
+            return {"code": 0, "path": "id:" + cid,
+                    "parent": "id:" + (current.parent_id if current else "0"),
+                    "data": [{"name": e.name, "path": "id:" + e.id, "type": "dir"}
+                             for e in client.listdir(cid) if e.is_dir]}
+        except CloudError as e:
+            return {"code": 400, "msg": str(e), "data": []}
+        except Exception:
+            return {"code": 500, "msg": "115 目录读取失败", "data": []}
+
+    def __api_redirect(self, request: Request, media_id: str = ""):
+        from starlette.responses import JSONResponse, RedirectResponse
+        if not re.fullmatch(r"[a-f0-9]{64}", media_id):
+            return JSONResponse({"error": "未登记的播放标识"}, status_code=404)
+        try:
+            url = self.__get_direct_service().playback_url(media_id, request.headers.get("User-Agent", ""))
+            return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"})
+        except KeyError:
+            return JSONResponse({"error": "未登记的播放标识"}, status_code=404)
+        except CloudError as e:
+            return JSONResponse({"error": str(e)}, status_code=503)
+        except Exception:
+            return JSONResponse({"error": "115 播放服务不可用"}, status_code=503)
 
     def __api_selftest(self, q: str = "SSIS-110") -> Dict[str, Any]:
         """逐源探测：区分 provider 不存在 / 搜不到 / 有结果"""
@@ -968,6 +1148,8 @@ class MetaTubeScraper(_PluginBase):
                 f"扫描目录: {stats.get('total', 0)} | 成功: {stats.get('ok', 0)} | "
                 f"跳过: {stats.get('skip', 0)} | 未识别: {stats.get('nomatch', 0)} | "
                 f"未找到: {stats.get('notfound', 0)} | 失败: {stats.get('fail', 0)}")
+        if stats.get("errors"):
+            text += " | 错误：" + "；".join(stats["errors"][-3:])
         return [{
             "component": "VAlert",
             "props": {
@@ -1009,8 +1191,8 @@ class MetaTubeScraper(_PluginBase):
                     "props": {
                         "type": "info",
                         "variant": "tonal",
-                        "text": "先选存储类型，再用目录浏览器逐级进入目标目录，最后点「添加为媒体目录」。"
-                                "网盘存储的浏览与写入通过 MoviePilot 存储接口完成，已按写入间隔限速以降低 115 风控风险。",
+                        "text": "115 Cookie 直连模式无需安装 115Lite。先保存 Cookie，再浏览目录并添加扫描目标。"
+                                "识别成功后关联改名云盘视频与字幕，本地按番号生成 STRM、字幕、NFO 和图片。",
                     },
                 },
                 row(
@@ -1025,6 +1207,23 @@ class MetaTubeScraper(_PluginBase):
                          tip="ID 必须与服务端 /v1/providers 返回完全一致（区分大小写）。"
                              "实测 FANZA 最稳定；FC2PPVDB/fc2hub 仅对 FC2 番号有效"),
                 ),
+                row(
+                    col({"component": "VTextField", "props": {
+                        "model": "cookie115", "label": "115 Cookie（直连模式）", "type": "password",
+                        "hint": "可复用 115Lite 的 Cookie；与上方 MetaTube Token 是不同凭据。修改后先保存。",
+                        "persistent-hint": True,
+                    }}, md=12),
+                ),
+                row(
+                    text("playback_base_url", "MoviePilot 播放入口地址", "https://mp.example.com",
+                         tip="填写 Emby/播放器可访问的 MoviePilot 地址；STRM 播放时由本插件 302 跳转到 115"),
+                    text("cloud_interval", "115 后台请求间隔（秒）", "5",
+                         tip="直连模式串行读取、改名和字幕下载的最小间隔，不保证任何固定值绝对安全"),
+                ),
+                row(col({"component": "VBtn", "props": {
+                    "color": "secondary", "variant": "tonal", "size": "small",
+                    "onClick": JS_CHECK115,
+                }, "text": "检查已保存的 115 Cookie"}, md=12)),
                 {
                     "component": "VCard",
                     "props": {"variant": "outlined", "class": "mt-2 mb-2"},
@@ -1035,8 +1234,8 @@ class MetaTubeScraper(_PluginBase):
                                 "component": "VAlert",
                                 "props": {"type": "warning", "variant": "tonal", "density": "compact",
                                           "class": "mb-3",
-                                          "text": "115Lite 存储不支持上传，只能浏览定位；写入请选「本地存储」"
-                                                  "（rclone/CloudDrive2 挂载路径）或「MP 原生 115（u115）」。",
+                                          "text": "115 直连会修改云盘视频和字幕名称，不移动原目录。首次请选择测试目录和独立本地输出目录。"
+                                                  "其他存储模式保留原有行为；115Lite 存储不支持上传。",
                                           },
                             },
                             row(
@@ -1049,6 +1248,7 @@ class MetaTubeScraper(_PluginBase):
                                         "itemValue": "value",
                                         "returnObject": False,
                                         "items": [
+                                            {"title": "115 Cookie 直连（独立生成 STRM）", "value": "115_direct"},
                                             {"title": "本地存储（local）", "value": "local"},
                                             {"title": "115Lite 网盘（仅浏览）", "value": "115Lite"},
                                             {"title": "MP 原生 115（u115，可上传）", "value": "u115"},
@@ -1062,6 +1262,8 @@ class MetaTubeScraper(_PluginBase):
                                         "model": "browse_path",
                                         "label": "当前浏览路径",
                                         "placeholder": "/jav",
+                                        "hint": "115 直连支持 /jav 等路径或 id:目录ID；选择目录后保存为稳定的目录 ID",
+                                        "persistent-hint": True,
                                     },
                                 }, cols=12, md=7),
                             ),
@@ -1113,7 +1315,7 @@ class MetaTubeScraper(_PluginBase):
                         "component": "VTextarea",
                         "props": {
                             "model": "scan_dirs",
-                            "label": "媒体目录（每行一个；本地填容器内绝对路径，网盘填网盘内路径如 /jav）",
+                            "label": "扫描目录（每行一个；115 直连使用目录 ID 或网盘路径，本地使用容器内路径）",
                             "rows": 3,
                         },
                     }, cols=12),
@@ -1129,14 +1331,13 @@ class MetaTubeScraper(_PluginBase):
                                 "props": {
                                     "type": "info", "variant": "tonal", "density": "compact",
                                     "class": "mb-3",
-                                    "text": "输出位置：网盘媒体库根目录与本地 STRM 目录一一对应，"
-                                            "网盘 /jav/SSIS-110 对应本地 {STRM根}/SSIS-110。"
-                                            "Emby/Jellyfin 读本地 NFO 即可；爆米花可直连 Emby 获得海报墙。",
+                                    "text": "115 直连固定输出到本地根目录/番号，包含 STRM、匹配字幕、NFO 和图片。"
+                                            "下方网盘写入、自动归位、通知 115Lite 等开关仅对其他存储模式生效。",
                                 },
                             },
                             row(
                                 switch("write_local", "写入本地 STRM 目录（推荐）",
-                                       tip="与 .strm 同级写 NFO/海报，零网盘写入风险"),
+                                       tip="其他存储模式控制本地 NFO/图片写入；115 直连始终输出本地媒体库"),
                                 switch("write_remote", "写入网盘目录",
                                        tip="需存储支持上传（u115/alist）；115Lite 不支持上传"),
                             ),
@@ -1144,7 +1345,7 @@ class MetaTubeScraper(_PluginBase):
                                 text("remote_lib_root", "网盘媒体库根目录", "/jav",
                                      tip="115Lite 里的媒体库目录，如 /jav"),
                                 text("local_strm_root", "本地 STRM 根目录", "/media/strm/jav",
-                                     tip="115Lite 配置中「本地 STRM 目录」对应的容器内路径"),
+                                     tip="MoviePilot 容器内可写路径；115 直连按番号输出，建议首次使用全新的目录"),
                             ),
                             row(
                                 switch("organize", "自动归位（资源库 → 媒体库）",
@@ -1230,7 +1431,7 @@ class MetaTubeScraper(_PluginBase):
                 ),
                 row(
                     switch("rename_files", "重命名视频文件为番号",
-                           tip="115 上重命名属敏感操作，默认关闭"),
+                           tip="仅控制其他存储模式；115 直连会按已识别番号同步规范视频和关联字幕名称"),
                     switch("numeric_ids", "识别无字母番号",
                            tip="加勒比 010115-001 / 一本道 061622_001 等，存在误识别风险"),
                 ),
@@ -1242,7 +1443,11 @@ class MetaTubeScraper(_PluginBase):
             "metatube_url": "",
             "metatube_token": "",
             "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub",
-            "storage": "local",
+            "storage": "115_direct",
+            "cookie115": "",
+            "playback_base_url": "",
+            "cloud_interval": 5,
+            "dir_parent": "id:0",
             "browse_path": "/",
             "pick_dir": None,
             "dir_items": [],
