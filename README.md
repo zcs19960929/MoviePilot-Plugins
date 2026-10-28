@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 |---|---|---|
-| [MetaTube 番号刮削](#metatube-番号刮削) | v1.0.0 | 调用自建 MetaTube 服务按番号刮削元数据，生成 NFO + 海报 + 剧照 |
+| [MetaTube 番号刮削](#metatube-番号刮削) | v1.0.1 | 调用自建 MetaTube 服务按番号刮削元数据，生成 NFO + 海报 + 剧照 |
 
 ---
 
@@ -57,7 +57,7 @@
 | 配置 | 默认 | 说明 |
 |---|---|---|
 | MetaTube 服务地址 | - | 如 `http://192.168.1.60:8090` |
-| Token | 空 | 未启用 token 的部署留空 |
+| Token | 空 | 服务端启用鉴权时填写相同的原始 Token，**无需添加 `Bearer` 前缀**；未启用时留空。修改后先保存再测试 |
 | 数据源优先级 | FANZA,JavBus,MGS,... | 逗号分隔按序尝试；**ID 必须与 `/v1/providers` 返回一致（区分大小写）**。实测 FANZA 最稳；FC2PPVDB/fc2hub 仅对 FC2 番号有效 |
 | **存储类型** | local | `local` 本地存储 / `115Lite` 网盘 / `u115` MP 原生 115 / 其他存储名 |
 | **媒体目录** | - | 每行一个；本地填容器内绝对路径，网盘填网盘内路径（如 `/jav`），用目录浏览器选择最稳妥 |
@@ -93,6 +93,10 @@
 - API 手动触发：`GET /api/v1/plugin/metatubescraper/run`（需 MP 登录凭证或 API_KEY）；
 - 数据源自检：`GET /api/v1/plugin/metatubescraper/selftest?q=SSIS-110`，
   用指定番号逐个测试已配置的数据源，区分「provider 不存在 / 搜不到 / 有结果」，排障利器。
+
+**测试前先保存配置**：测试按钮使用服务端已保存的 MetaTube 地址、Token 和数据源，
+不会读取表单中尚未保存的修改。自检与正式刮削均通过 `Authorization: Bearer <Token>` 鉴权。
+`/v1/providers` 可公开访问，返回 200 不能证明 Token 有效；应使用搜索接口验证。
 
 ### 七、存储与目录选择
 
@@ -225,6 +229,7 @@ docker logs -f moviepilot 2>&1 | grep -i metatube
 
 | 现象 | 排查 |
 |---|---|
+| 测试数据源全部返回 401 | 更新插件至 v1.0.1 或更高版本（修复自检漏传 Token）；填写与服务端一致的原始 Token，先保存再测试。若仍为 401，检查服务端实际启用的 Token。404/500 是后续检索错误，应按数据源返回详情排查 |
 | 统计里「未识别」多 | 开「识别无字母番号」试试；注意噪音词（H265/10bit 等）已内置过滤 |
 | 「未检索到」多 | 先 `GET /v1/providers` 确认数据源存在，**provider ID 区分大小写**（如 `JavBus`/`FANZA`/`MGS`，官方镜像没有 javdb/javlibrary/avmoo，填错报 404 provider not found）；或直接调插件 `/selftest` API 逐源探测；看 metatube 容器日志（源站需代理） |
 | NFO 写入失败/卡住 | 115 挂载写权限、uid/gid 映射；风控时会有明显延迟或报错 |

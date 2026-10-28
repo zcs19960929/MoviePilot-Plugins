@@ -187,7 +187,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -321,12 +321,16 @@ class MetaTubeScraper(_PluginBase):
 
     # ---------------- MetaTube 客户端 ----------------
 
-    def __mt_get(self, path: str, params: dict = None,
-                 stream: bool = False, timeout: int = 20):
-        url = f"{self._url.rstrip('/')}{path}"
+    def __mt_headers(self) -> Dict[str, str]:
         headers = {"User-Agent": "MoviePilot-MetaTubeScraper/1.1"}
         if self._token:
             headers["Authorization"] = f"Bearer {self._token}"
+        return headers
+
+    def __mt_get(self, path: str, params: dict = None,
+                 stream: bool = False, timeout: int = 20):
+        url = f"{self._url.rstrip('/')}{path}"
+        headers = self.__mt_headers()
         for attempt in range(2):
             try:
                 resp = requests.get(url, params=params, headers=headers,
@@ -922,7 +926,7 @@ class MetaTubeScraper(_PluginBase):
             label = p or "全局"
             try:
                 resp = requests.get(f"{self._url.rstrip('/')}/v1/movies/search",
-                                    params=params, timeout=20)
+                                    params=params, headers=self.__mt_headers(), timeout=20)
                 if resp.status_code == 200:
                     data = (resp.json() or {}).get("data") or []
                     if data:
@@ -1011,9 +1015,9 @@ class MetaTubeScraper(_PluginBase):
                 },
                 row(
                     text("metatube_url", "MetaTube 服务地址", "http://192.168.31.60:8090",
-                         tip="官方镜像端口映射 8090 -> 8080；未启用 token 时留空"),
+                         tip="官方镜像端口映射 8090 -> 8080；填写 MoviePilot 容器可达的地址"),
                     text("metatube_token", "Token（可选）", "留空即可",
-                         tip="仅当服务端启动参数带 -token 时填写"),
+                         tip="服务端启用鉴权时填写原始 Token，无需添加 Bearer；未启用时留空"),
                 ),
                 row(
                     text("providers", "数据源优先级", "FANZA,JavBus,MGS,FC2PPVDB,fc2hub",
@@ -1208,7 +1212,9 @@ class MetaTubeScraper(_PluginBase):
                     col({
                         "component": "VTextField",
                         "props": {"model": "test_number", "label": "测试用番号",
-                                  "placeholder": "SSIS-110"},
+                                  "placeholder": "SSIS-110",
+                                  "hint": "测试使用已保存的服务地址、Token 和数据源；修改配置后请先保存",
+                                  "persistent-hint": True},
                     }, cols=12, md=3),
                     col({
                         "component": "VTextField",
