@@ -103,6 +103,9 @@ NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DV", "
 
 # ---- 表单目录浏览器的事件脚本（MoviePilot V3 FormRender 支持 on* 事件字符串）----
 JS_LOAD = """async () => {
+  dir_items = [];
+  const requestItems = dir_items;
+  const isCurrent = () => dir_items === requestItems;
   dir_loading = true; dir_error = '';
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
@@ -110,36 +113,41 @@ JS_LOAD = """async () => {
     const r = st === '115_direct'
       ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(p))
       : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: p, type: 'dir' });
+    if (!isCurrent()) return;
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
     if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
-    dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
+    requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
-    dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
-  } finally { dir_loading = false; }
+    if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
+  } finally { if (isCurrent()) dir_loading = false; }
 }"""
 
 JS_ENTER = """async (v) => {
   const path = (v && v.value) ? v.value : v;
   if (!path) return;
   browse_path = path; pick_dir = null;
+  dir_items = [];
+  const requestItems = dir_items;
+  const isCurrent = () => dir_items === requestItems;
   dir_loading = true; dir_error = '';
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
     const r = st === '115_direct'
       ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(path))
       : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: path, type: 'dir' });
+    if (!isCurrent()) return;
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
     if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
-    dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
+    requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
-    dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
-  } finally { dir_loading = false; }
+    if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
+  } finally { if (isCurrent()) dir_loading = false; }
 }"""
 
 JS_UP = """async () => {
@@ -148,19 +156,23 @@ JS_UP = """async () => {
   const i = p.lastIndexOf('/');
   browse_path = st === '115_direct' ? (dir_parent || 'id:0') : (i <= 0 ? '/' : p.slice(0, i));
   pick_dir = null;
+  dir_items = [];
+  const requestItems = dir_items;
+  const isCurrent = () => dir_items === requestItems;
   dir_loading = true; dir_error = '';
   try {
     const r = st === '115_direct'
       ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(browse_path))
       : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: browse_path, type: 'dir' });
+    if (!isCurrent()) return;
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
     if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
-    dir_items = arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path }));
+    requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
   } catch (e) {
-    dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
-  } finally { dir_loading = false; }
+    if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
+  } finally { if (isCurrent()) dir_loading = false; }
 }"""
 
 JS_SELFTEST = """async () => {
@@ -212,6 +224,13 @@ JS_ADD = """() => {
   dir_error = '已添加：' + p;
 }"""
 
+JS_STORAGE_CHANGE = """(value) => {
+  storage = (value && typeof value === 'object') ? (value.value || value.title || 'local') : (value || 'local');
+  browse_path = '/'; dir_parent = 'id:0'; dir_items = []; pick_dir = null;
+  dir_loading = false; run_msg = '';
+  dir_error = '存储已切换，请重新确认扫描目录后保存；已填参数保留，不会自动转换路径。';
+}"""
+
 
 class MetaTubeScraper(_PluginBase):
     plugin_name = "MetaTube 番号刮削"
@@ -220,7 +239,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.0"
+    plugin_version = "1.1.1"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -338,14 +357,48 @@ class MetaTubeScraper(_PluginBase):
         self._remote_lib_root = _pick_str(config.get("remote_lib_root")).rstrip("/")
         self._organize = bool(config.get("organize"))
         self._trigger_strm = bool(config.get("trigger_strm", True))
+        # Compute effective options without modifying saved values: switching
+        # back to a compatible mode restores the user's original selections.
+        if self._storage == "115_direct":
+            self._write_local = True
+            self._write_remote = self._organize = self._trigger_strm = False
+            self._rename_files = self._download_previews = False
+        elif self._is_local:
+            self._write_local = True
+            self._write_remote = self._organize = self._trigger_strm = False
+        elif self._storage == "115Lite":
+            self._write_remote = self._organize = False
         self._upload_unsupported = False
 
     @property
-    def _config_ok(self) -> bool:
+    def _config_errors(self) -> List[str]:
+        """Validate effective output settings before a task can mutate storage."""
+        errors = []
+        if not self._enabled:
+            errors.append("请先启用插件")
+        if not self._url:
+            errors.append("请填写 MetaTube 服务地址")
+        if not self._scan_dirs:
+            errors.append("请添加扫描目录")
         if self._storage == "115_direct":
-            return bool(self._enabled and self._url and self._scan_dirs and self._cookie115
-                        and self._local_strm_root and self._playback_base_url)
-        return bool(self._enabled and self._url and self._scan_dirs)
+            if not self._cookie115:
+                errors.append("请填写 115 Cookie")
+            if not self._local_strm_root:
+                errors.append("请填写本地媒体库根目录")
+            if not self._playback_base_url:
+                errors.append("请填写 MoviePilot 播放入口地址")
+        elif not self._is_local:
+            if not (self._write_local or self._write_remote):
+                errors.append("请至少启用一种有效输出；115Lite 模式需要开启本地元数据输出")
+            if self._write_local and not self._local_strm_root:
+                errors.append("本地元数据输出需要填写本地媒体库根目录")
+            if (self._write_local or self._organize) and not self._remote_lib_root:
+                errors.append("目录映射或自动归位需要填写网盘媒体库根目录")
+        return errors
+
+    @property
+    def _config_ok(self) -> bool:
+        return not self._config_errors
 
     @property
     def _is_local(self) -> bool:
@@ -658,7 +711,7 @@ class MetaTubeScraper(_PluginBase):
             if result is None:
                 self._upload_unsupported = True
                 self.error(
-                    f"存储「{self._storage}」不支持上传（115Lite 仅支持浏览/移动/重命名/删除）。"
+                    f"存储「{self._storage}」不支持元数据上传。"
                     f"请改用 MP 原生 115 存储（u115）或本地挂载路径写入。"
                 )
                 return False
@@ -877,8 +930,8 @@ class MetaTubeScraper(_PluginBase):
             if local_dir and not self._is_local and not self.__under_lib(final_remote):
                 if not remote_write:
                     self.warn(
-                        f"[{number}] 影片不在媒体库根目录（{final_remote}）下，且未开启自动归位；"
-                        f"为避免生成本地空目录，本轮跳过。请开启「自动归位」或先移动影片后再跑。"
+                        f"[{number}] 影片路径 {final_remote} 不在网盘媒体库根目录内，无法映射到本地；"
+                        "本轮跳过，请核对根目录或先将影片整理到媒体库目录中。"
                     )
                     return "skip"
                 local_dir = None
@@ -1126,8 +1179,9 @@ class MetaTubeScraper(_PluginBase):
         return {"code": 0, "msg": f"{number} → " + " | ".join(lines)}
 
     def __api_run(self) -> Dict[str, Any]:
-        if not self._config_ok:
-            return {"code": 400, "msg": "插件未启用，或服务地址/媒体目录未配置"}
+        errors = self._config_errors
+        if errors:
+            return {"code": 400, "msg": "；".join(errors) + "；修改后请先保存配置"}
         if self._running:
             return {"code": 400, "msg": "刮削任务正在运行中，请勿重复触发"}
         threading.Thread(target=self.__scrape_all, daemon=True).start()
@@ -1162,315 +1216,161 @@ class MetaTubeScraper(_PluginBase):
     # ---------------- 配置表单 ----------------
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
+        """Show only effective options, using the host's reactive form expressions."""
+        mode = "((storage && typeof storage === 'object') ? (storage.value || storage.title || 'local') : (storage || 'local'))"
+        direct = f"({mode} === '115_direct')"
+        local = f"({mode} === 'local')"
+        lite = f"({mode} === '115Lite')"
+        remote = f"(!{direct} && !{local})"
+        writable = f"({remote} && !{lite})"
+        mapped = f"({remote} && write_local)"
+        moving = f"({writable} && organize)"
+        legacy = f"(!{direct})"
 
-        def row(*cols) -> dict:
-            return {"component": "VRow", "content": list(cols)}
+        def expr(code):
+            return "{{ " + code + " }}"
 
-        def col(*items, cols=12, md=6) -> dict:
-            return {"component": "VCol", "props": {"cols": cols, "md": md}, "content": list(items)}
+        def col(*items, md=6, show=None):
+            props = {"cols": 12, "md": md}
+            if show:
+                props["show"] = expr(show)
+            return {"component": "VCol", "props": props, "content": list(items)}
 
-        def text(model: str, label: str, placeholder: str = "", md: int = 6, tip: str = "") -> dict:
-            props = {"model": model, "label": label, "placeholder": placeholder}
+        def row(*columns):
+            node = {"component": "VRow", "content": list(columns)}
+            # Hide the row as well as its columns; modes never leave blank rows.
+            conditions = [c.get("props", {}).get("show") for c in columns]
+            if conditions and all(conditions):
+                node["props"] = {"show": expr(" || ".join("(" + c[3:-3] + ")" for c in conditions))}
+            return node
+
+        def text(model, label, placeholder="", tip="", md=6, show=None, **extra):
+            props = {"model": model, "label": label, "placeholder": placeholder, **extra}
             if tip:
-                props["hint"] = tip
-                props["persistent-hint"] = True
-            return col({"component": "VTextField", "props": props}, md=md)
+                props.update(hint=tip, **{"persistent-hint": True})
+            return col({"component": "VTextField", "props": props}, md=md, show=show)
 
-        def switch(model: str, label: str, md: int = 6, tip: str = "") -> dict:
+        def switch(model, label, tip="", show=None):
             props = {"model": model, "label": label}
             if tip:
-                props["hint"] = tip
-                props["persistent-hint"] = True
-            return col({"component": "VSwitch", "props": props}, md=md)
+                props.update(hint=tip, **{"persistent-hint": True})
+            return col({"component": "VSwitch", "props": props}, show=show)
 
-        form = [{
-            "component": "VForm",
-            "content": [
-                {
-                    "component": "VAlert",
-                    "props": {
-                        "type": "info",
-                        "variant": "tonal",
-                        "text": "115 Cookie 直连模式无需安装 115Lite。先保存 Cookie，再浏览目录并添加扫描目标。"
-                                "识别成功后关联改名云盘视频与字幕，本地按番号生成 STRM、字幕、NFO 和图片。",
-                    },
-                },
-                row(
-                    text("metatube_url", "MetaTube 服务地址", "http://192.168.31.60:8090",
-                         tip="官方镜像端口映射 8090 -> 8080；填写 MoviePilot 容器可达的地址"),
-                    text("metatube_token", "Token（可选）", "留空即可",
-                         tip="服务端启用鉴权时填写原始 Token，无需添加 Bearer；未启用时留空"),
-                ),
-                row(
-                    text("providers", "数据源优先级", "FANZA,JavBus,MGS,FC2PPVDB,fc2hub",
-                         md=12,
-                         tip="ID 必须与服务端 /v1/providers 返回完全一致（区分大小写）。"
-                             "实测 FANZA 最稳定；FC2PPVDB/fc2hub 仅对 FC2 番号有效"),
-                ),
-                row(
-                    col({"component": "VTextField", "props": {
-                        "model": "cookie115", "label": "115 Cookie（直连模式）", "type": "password",
-                        "hint": "可复用 115Lite 的 Cookie；与上方 MetaTube Token 是不同凭据。修改后先保存。",
-                        "persistent-hint": True,
-                    }}, md=12),
-                ),
-                row(
-                    text("playback_base_url", "MoviePilot 播放入口地址", "https://mp.example.com",
-                         tip="填写 Emby/播放器可访问的 MoviePilot 地址；STRM 播放时由本插件 302 跳转到 115"),
-                    text("cloud_interval", "115 后台请求间隔（秒）", "5",
-                         tip="直连模式串行读取、改名和字幕下载的最小间隔，不保证任何固定值绝对安全"),
-                ),
-                row(col({"component": "VBtn", "props": {
-                    "color": "secondary", "variant": "tonal", "size": "small",
-                    "onClick": JS_CHECK115,
-                }, "text": "检查已保存的 115 Cookie"}, md=12)),
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mt-2 mb-2"},
-                    "content": [{
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {"type": "warning", "variant": "tonal", "density": "compact",
-                                          "class": "mb-3",
-                                          "text": "115 直连会修改云盘视频和字幕名称，不移动原目录。首次请选择测试目录和独立本地输出目录。"
-                                                  "其他存储模式保留原有行为；115Lite 存储不支持上传。",
-                                          },
-                            },
-                            row(
-                                col({
-                                    "component": "VCombobox",
-                                    "props": {
-                                        "model": "storage",
-                                        "label": "存储类型",
-                                        "itemTitle": "title",
-                                        "itemValue": "value",
-                                        "returnObject": False,
-                                        "items": [
-                                            {"title": "115 Cookie 直连（独立生成 STRM）", "value": "115_direct"},
-                                            {"title": "本地存储（local）", "value": "local"},
-                                            {"title": "115Lite 网盘（仅浏览）", "value": "115Lite"},
-                                            {"title": "MP 原生 115（u115，可上传）", "value": "u115"},
-                                            {"title": "其他存储（可手填存储名）", "value": "alist"},
-                                        ],
-                                    },
-                                }, cols=12, md=5),
-                                col({
-                                    "component": "VTextField",
-                                    "props": {
-                                        "model": "browse_path",
-                                        "label": "当前浏览路径",
-                                        "placeholder": "/jav",
-                                        "hint": "115 直连支持 /jav 等路径或 id:目录ID；选择目录后保存为稳定的目录 ID",
-                                        "persistent-hint": True,
-                                    },
-                                }, cols=12, md=7),
-                            ),
-                            row(
-                                col({
-                                    "component": "VBtn",
-                                    "props": {"size": "small", "variant": "tonal",
-                                              "prepend-icon": "mdi-folder-refresh", "onClick": JS_LOAD},
-                                    "text": "读取目录",
-                                }, cols=6, md=2),
-                                col({
-                                    "component": "VBtn",
-                                    "props": {"size": "small", "variant": "tonal",
-                                              "prepend-icon": "mdi-arrow-up-bold", "onClick": JS_UP},
-                                    "text": "上一级",
-                                }, cols=6, md=2),
-                                col({
-                                    "component": "VBtn",
-                                    "props": {"size": "small", "color": "primary", "variant": "flat",
-                                              "prepend-icon": "mdi-plus", "onClick": JS_ADD},
-                                    "text": "添加为媒体目录",
-                                }, cols=12, md=3),
-                            ),
-                            row(
-                                col({
-                                    "component": "VSelect",
-                                    "props": {
-                                        "model": "pick_dir",
-                                        "label": "子目录（选择后自动进入）",
-                                        "items": "{{ dir_items }}",
-                                        "itemTitle": "title",
-                                        "itemValue": "value",
-                                        "returnObject": False,
-                                        "clearable": True,
-                                        "onUpdate:modelValue": JS_ENTER,
-                                    },
-                                }, cols=12, md=8),
-                                col({
-                                    "component": "VTextField",
-                                    "props": {"model": "dir_error", "label": "浏览状态",
-                                              "readonly": True, "variant": "plain"},
-                                }, cols=12, md=4),
-                            ),
-                        ],
-                    }],
-                },
-                row(
-                    col({
-                        "component": "VTextarea",
-                        "props": {
-                            "model": "scan_dirs",
-                            "label": "扫描目录（每行一个；115 直连使用目录 ID 或网盘路径，本地使用容器内路径）",
-                            "rows": 3,
-                        },
-                    }, cols=12),
-                ),
-                {
-                    "component": "VCard",
-                    "props": {"variant": "outlined", "class": "mb-2"},
-                    "content": [{
-                        "component": "VCardText",
-                        "content": [
-                            {
-                                "component": "VAlert",
-                                "props": {
-                                    "type": "info", "variant": "tonal", "density": "compact",
-                                    "class": "mb-3",
-                                    "text": "115 直连固定输出到本地根目录/番号，包含 STRM、匹配字幕、NFO 和图片。"
-                                            "下方网盘写入、自动归位、通知 115Lite 等开关仅对其他存储模式生效。",
-                                },
-                            },
-                            row(
-                                switch("write_local", "写入本地 STRM 目录（推荐）",
-                                       tip="其他存储模式控制本地 NFO/图片写入；115 直连始终输出本地媒体库"),
-                                switch("write_remote", "写入网盘目录",
-                                       tip="需存储支持上传（u115/alist）；115Lite 不支持上传"),
-                            ),
-                            row(
-                                text("remote_lib_root", "网盘媒体库根目录", "/jav",
-                                     tip="115Lite 里的媒体库目录，如 /jav"),
-                                text("local_strm_root", "本地 STRM 根目录", "/media/strm/jav",
-                                     tip="MoviePilot 容器内可写路径；115 直连按番号输出，建议首次使用全新的目录"),
-                            ),
-                            row(
-                                switch("organize", "自动归位（资源库 → 媒体库）",
-                                       tip="把番号影片移动到 媒体库根目录/番号 下；"
-                                           "需要存储实现 move（u115 支持，115Lite 不支持）"),
-                                switch("trigger_strm", "刮完通知 115Lite 生成 STRM",
-                                       tip="等价于对该目录执行 /115strm；需 115Lite 里已配置"
-                                           "「本地STRM目录#网盘目录」映射"),
-                            ),
-                        ],
-                    }],
-                },
-                row(
-                    col({
-                        "component": "VSelect",
-                        "props": {
-                            "model": "scan_mode",
-                            "label": "扫描模式",
-                            "items": [
-                                {"title": "仅扫描一级子目录（推荐，目录请求最少）", "value": "subdir"},
-                                {"title": "递归扫描（网盘模式最多 3 层，请求较多）", "value": "recursive"},
-                            ],
-                        },
-                    }, md=6),
-                    text("file_interval", "文件写入间隔（秒）", "3",
-                         tip="每次目录读取与文件写入前的等待，115 建议不低于 3 秒"),
-                ),
-                row(
-                    text("movie_limit", "单次处理影片上限", "30", tip="每次任务最多处理多少部，剩余下次继续"),
-                    col({
-                        "component": "VRow",
-                        "content": [
-                            col({"component": "VTextField",
-                                 "props": {"model": "cron_hour", "label": "定时-时(0-23)"}}, cols=6),
-                            col({"component": "VTextField",
-                                 "props": {"model": "cron_minute", "label": "定时-分(0-59)"}}, cols=6),
-                        ],
-                    }, md=6),
-                ),
-                row(
-                    switch("enabled", "启用插件"),
-                    switch("force_overwrite", "强制覆盖已有 NFO / 图片",
-                           tip="关闭时跳过已存在 movie.nfo 的目录（增量模式）"),
-                ),
-                row(
-                    col({
-                        "component": "VBtn",
-                        "props": {"color": "primary", "variant": "flat", "size": "small",
-                                  "prepend-icon": "mdi-play", "onClick": JS_RUN},
-                        "text": "立即执行刮削",
-                    }, cols=12, md=3),
-                    col({
-                        "component": "VTextField",
-                        "props": {"model": "run_msg", "label": "执行结果",
-                                  "readonly": True, "variant": "plain"},
-                    }, cols=12, md=9),
-                ),
-                row(
-                    col({
-                        "component": "VBtn",
-                        "props": {"color": "secondary", "variant": "tonal", "size": "small",
-                                  "prepend-icon": "mdi-flask", "onClick": JS_SELFTEST},
-                        "text": "测试数据源",
-                    }, cols=12, md=3),
-                    col({
-                        "component": "VTextField",
-                        "props": {"model": "test_number", "label": "测试用番号",
-                                  "placeholder": "SSIS-110",
-                                  "hint": "测试使用已保存的服务地址、Token 和数据源；修改配置后请先保存",
-                                  "persistent-hint": True},
-                    }, cols=12, md=3),
-                    col({
-                        "component": "VTextField",
-                        "props": {"model": "run_msg", "label": "测试结果",
-                                  "readonly": True, "variant": "plain"},
-                    }, cols=12, md=6),
-                ),
-                row(
-                    switch("download_previews", "下载剧照",
-                           tip="直接下载源站原图，会增加文件写入量"),
-                    col({"component": "VTextField",
-                         "props": {"model": "preview_limit", "label": "剧照张数上限"}}, md=6),
-                ),
-                row(
-                    switch("rename_files", "重命名视频文件为番号",
-                           tip="仅控制其他存储模式；115 直连会按已识别番号同步规范视频和关联字幕名称"),
-                    switch("numeric_ids", "识别无字母番号",
-                           tip="加勒比 010115-001 / 一本道 061622_001 等，存在误识别风险"),
-                ),
-            ],
-        }]
+        def alert(message, show=None, kind="info"):
+            props = {"type": kind, "variant": "tonal", "density": "compact", "class": "mb-2", "text": message}
+            if show:
+                props["show"] = expr(show)
+            return {"component": "VAlert", "props": props}
 
+        def button(label, script, show=None, icon=None):
+            props = {"variant": "tonal", "size": "small", "color": "primary", "onClick": script}
+            if icon:
+                props["prepend-icon"] = icon
+            return col({"component": "VBtn", "props": props, "text": label}, md=4, show=show)
+
+        form = [{"component": "VForm", "content": [
+            alert("检查、浏览和执行均使用已保存配置；修改后请先保存。切换存储不会清空已填参数。"),
+            row(
+                text("metatube_url", "MetaTube 服务地址", "http://192.168.31.60:8090",
+                     "填写 MoviePilot 容器可访问的后端地址"),
+                text("metatube_token", "MetaTube Token（可选）", tip="服务端启用鉴权时填写原始 Token，无需添加 Bearer；未启用时留空"),
+            ),
+            row(text("providers", "数据源优先级", "FANZA,JavBus,JAV321,MGS",
+                     "按顺序尝试，站点可用性以自检为准；ID 与 /v1/providers 一致，FC2 专用源仅适用于 FC2 番号", md=12)),
+            row(col({"component": "VCombobox", "props": {
+                "model": "storage", "label": "存储类型", "itemTitle": "title", "itemValue": "value", "returnObject": False,
+                "onUpdate:modelValue": JS_STORAGE_CHANGE,
+                "items": [
+                    {"title": "115 Cookie 直连（独立生成 STRM）", "value": "115_direct"},
+                    {"title": "本地存储（local）", "value": "local"},
+                    {"title": "115Lite 兼容模式（本地元数据）", "value": "115Lite"},
+                    {"title": "MP 原生 115（u115，可上传）", "value": "u115"},
+                    {"title": "其他存储（可手填存储名）", "value": "alist"},
+                ],
+            }}, md=12)),
+            alert("直连模式会在原目录规范视频和关联字幕名称，不移动目录；独立生成 STRM、字幕、NFO 和图片。", direct),
+            alert("本地模式在影片原目录生成 NFO 和图片，不生成 STRM。", local),
+            alert("115Lite 兼容模式不支持元数据上传和本插件的自动归位；可写本地 NFO/图片，并通知 115Lite 生成 STRM。", lite),
+            alert("通过 MoviePilot 存储接口读写；上传、移动是否可用取决于所选存储。", writable),
+            row(text("cookie115", "115 Cookie", tip="可复用 115Lite Cookie；与 MetaTube Token 不同。修改后先保存再检查。",
+                     md=12, show=direct, type="password")),
+            row(
+                text("playback_base_url", "MoviePilot 播放入口地址", "https://mp.example.com",
+                     "填写 Emby/播放器可访问的 MoviePilot 地址；播放时由本插件 302 跳转到 115", show=direct),
+                text("cloud_interval", "115 后台请求间隔（秒）", "5",
+                     "串行读取、改名和字幕取链的请求间隔；不保证固定间隔绝对安全", show=direct),
+            ),
+            row(button("检查已保存的 115 Cookie", JS_CHECK115, show=direct)),
+            {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2"}, "content": [
+                {"component": "VCardText", "content": [
+                    row(text("browse_path", "当前浏览路径", "/",
+                             expr(f"{direct} ? '支持 /jav 或 id:目录ID；浏览后以稳定 ID 添加扫描目标' : ({local} ? '填写容器内绝对路径' : '填写所选存储内的路径，如 /jav')"), md=12)),
+                    row(button("读取目录", JS_LOAD, icon="mdi-folder-refresh"),
+                        button("上一级", JS_UP, icon="mdi-arrow-up-bold"),
+                        button("添加为扫描目录", JS_ADD, icon="mdi-plus")),
+                    row(col({"component": "VSelect", "props": {
+                            "model": "pick_dir", "label": "子目录（选择后自动进入）", "items": "{{ dir_items }}",
+                            "itemTitle": "title", "itemValue": "value", "returnObject": False,
+                            "clearable": True, "onUpdate:modelValue": JS_ENTER,
+                        }}, md=8),
+                        text("dir_error", "浏览状态", md=4, readonly=True, variant="plain")),
+                ]},
+            ]},
+            row(col({"component": "VTextarea", "props": {
+                "model": "scan_dirs", "label": "扫描目录（每行一个）", "rows": 3,
+                "hint": expr(f"{direct} ? '115 目录 ID 或网盘路径，如 id:123 或 /jav；切换存储后请重新确认' : ({local} ? '容器内影片目录的绝对路径；不接受 115 目录 ID' : '所选存储内的目录路径；与本地路径、115 直连 ID 不通用')"),
+                "persistent-hint": True,
+            }}, md=12)),
+            {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2", "show": expr(f"!{local}")}, "content": [
+                {"component": "VCardText", "content": [
+                    alert("输出到本地根目录/番号；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
+                    row(switch("write_local", "在本地生成 NFO 和图片", "这里只写元数据，不生成 STRM", show=remote),
+                        switch("write_remote", "向网盘写入 NFO 和图片", "需要所选存储支持上传", show=writable)),
+                    alert("尚未选择有效输出；115Lite 模式需要启用本地元数据输出。",
+                          f"{remote} && !write_local && (!{writable} || !write_remote)", kind="warning"),
+                    row(text("remote_lib_root", "网盘媒体库根目录", "/jav",
+                             "用于本地路径映射或自动归位；未开启归位时，影片须已位于此目录内", show=f"{mapped} || {moving}"),
+                        text("local_strm_root", "本地媒体库根目录", "/media/strm/jav",
+                             expr(f"{direct} ? '容器内可写路径，按番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
+                    row(switch("organize", "自动归位到网盘媒体库", "需要存储支持移动；仅移动视频，外挂字幕不会跟随", show=writable),
+                        switch("trigger_strm", "刮完通知 115Lite 生成 STRM",
+                               "仅适用于同一 115 网盘目录；需启用 115Lite 并配置本地目录与网盘目录映射",
+                               show=f"{remote} && (write_local || ({writable} && write_remote))")),
+                ]},
+            ]},
+            row(col({"component": "VSelect", "props": {
+                    "model": "scan_mode", "label": "扫描模式",
+                    "items": expr(f"[{{title: {direct} ? '扫描根目录及一级子目录' : '仅扫描一级影片子目录', value: 'subdir'}}, {{title: '递归扫描', value: 'recursive'}}]"),
+                    "hint": expr(f"{direct} ? '包含根目录散装视频；递归最多 3 层，请求较多' : ({local} ? '递归遇到影片目录后停止继续深入' : '递归最多 3 层，请求较多')"),
+                    "persistent-hint": True,
+                }}),
+                text("file_interval", "兼容模式读写间隔（秒）", "3", "受控读写前的等待时间，不是风控安全保证", show=legacy)),
+            row(text("movie_limit", "单次处理影片上限", "30", "每轮处理上限，剩余影片下次继续"),
+                col({"component": "VRow", "content": [
+                    text("cron_hour", "定时-时（0–23）", md=6), text("cron_minute", "定时-分（0–59）", md=6),
+                ]})),
+            row(switch("enabled", "启用插件"),
+                switch("force_overwrite", expr(f"{direct} ? '重新获取元数据、图片和字幕' : '覆盖已有 NFO 和图片'"),
+                       expr(f"{direct} ? '关闭时仍会补齐缺失文件；开启后也只更新本插件拥有且未被修改的文件，不接管外部文件' : '关闭时跳过已有 movie.nfo 的影片目录；开启后可能覆盖已有 NFO 和图片'"))),
+            row(switch("download_previews", "下载剧照", "从源站下载剧照，会增加网络请求和文件写入", show=legacy),
+                text("preview_limit", "剧照张数上限", "10", "填写正整数", show=f"{legacy} && download_previews")),
+            row(switch("rename_files", "重命名视频为番号", "仅改视频，不同步改名外挂字幕；有外挂字幕时请谨慎开启", show=legacy),
+                switch("numeric_ids", "识别无字母番号", "如加勒比或一本道的纯数字编号，存在误识别风险")),
+            row(button("立即执行刮削", JS_RUN, icon="mdi-play"),
+                text("run_msg", "执行结果", md=8, readonly=True, variant="plain")),
+            row(button("测试数据源", JS_SELFTEST, icon="mdi-flask"),
+                text("test_number", "测试用番号", "SSIS-110", "修改配置后先保存再测试", md=8)),
+        ]}]
         data = {
-            "enabled": False,
-            "metatube_url": "",
-            "metatube_token": "",
-            "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub",
-            "storage": "115_direct",
-            "cookie115": "",
-            "playback_base_url": "",
-            "cloud_interval": 5,
-            "dir_parent": "id:0",
-            "browse_path": "/",
-            "pick_dir": None,
-            "dir_items": [],
-            "dir_error": "",
-            "run_msg": "",
-            "test_number": "SSIS-110",
-            "scan_dirs": "",
-            "write_local": True,
-            "write_remote": False,
-            "remote_lib_root": "",
-            "local_strm_root": "",
-            "organize": False,
-            "trigger_strm": True,
-            "scan_mode": "subdir",
-            "file_interval": 3,
-            "movie_limit": 30,
-            "cron_hour": 4,
-            "cron_minute": 30,
-            "force_overwrite": False,
-            "download_previews": False,
-            "preview_limit": 10,
-            "rename_files": False,
-            "numeric_ids": False,
+            "enabled": False, "metatube_url": "", "metatube_token": "",
+            "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub", "storage": "115_direct",
+            "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
+            "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
+            "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
+            "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
+            "organize": False, "trigger_strm": True, "scan_mode": "subdir", "file_interval": 3,
+            "movie_limit": 30, "cron_hour": 4, "cron_minute": 30, "force_overwrite": False,
+            "download_previews": False, "preview_limit": 10, "rename_files": False, "numeric_ids": False,
         }
         return form, data
 

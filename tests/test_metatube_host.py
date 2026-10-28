@@ -105,12 +105,17 @@ class HostTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = fixture.make(directory)
             plugin = load_plugin("v3", Mock())
-            plugin.init_plugin({"enabled": True, "storage": "115_direct", "metatube_url": "http://backend", "cookie115": "fixture", "scan_dirs": "id:0", "local_strm_root": str(Path(directory) / "library"), "playback_base_url": "https://mp.example"})
+            plugin.init_plugin({"enabled": True, "storage": "115_direct", "metatube_url": "http://backend", "cookie115": "fixture", "scan_dirs": "id:0", "local_strm_root": str(Path(directory) / "library"), "playback_base_url": "https://mp.example", "trigger_strm": True, "write_remote": True, "organize": True})
             plugin._direct_service = service
             plugin.save_data = Mock()
-            plugin._MetaTubeScraper__scrape_all()
+            events = []
+            with patch.dict(plugin._MetaTubeScraper__trigger_strm.__func__.__globals__,
+                            eventmanager=types.SimpleNamespace(send_event=lambda *args: events.append(args)),
+                            EventType=types.SimpleNamespace(PluginAction="plugin-action")):
+                plugin._MetaTubeScraper__scrape_all()
             self.assertEqual(plugin.save_data.call_args.args[1]["ok"], 1)
             self.assertTrue((Path(directory) / "library/DSOD-060/DSOD-060.strm").is_file())
+            self.assertEqual(events, [])
 
     def test_host_factory_uses_real_backend_callbacks_and_independent_auth(self):
         fixture = fixtures.DirectAcceptanceTests()
