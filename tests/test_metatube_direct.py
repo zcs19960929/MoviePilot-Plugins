@@ -121,6 +121,94 @@ class DirectAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.run(["0"])["notfound"], 1)
             self.assertEqual(cloud.renames, [])
 
+    def test_owned_nfo_format_upgrade_uses_cache_without_cloud_writes_or_downloads(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                self.assertEqual(service.run(["0"])["ok"], 1)
+                output = Path(directory) / "library/DSOD-060"
+                preserved = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in output.iterdir() if p.name != "movie.nfo"}
+                service.build_nfo = lambda info, number: ("<movie><title>" + number + " " + info['title'] + "</title><plot>上映日期：2026-09-18</plot></movie>").encode()
+                cloud.rename = Mock(side_effect=AssertionError("no cloud rename during NFO upgrade"))
+                cloud.download_bytes = Mock(side_effect=AssertionError("no subtitle download during NFO upgrade"))
+                service.artwork = Mock(side_effect=AssertionError("no artwork download during NFO upgrade"))
+                metadata.reset_mock()
+                self.assertEqual(service.run(["0"])["ok"], 1)
+                metadata.assert_not_called()
+                self.assertEqual(ET.fromstring((output / 'movie.nfo').read_bytes()).findtext('title'), 'DSOD-060 Example')
+                for name, expected in preserved.items():
+                    path = output / name
+                    self.assertEqual((path.read_bytes(), path.stat().st_mtime_ns), expected)
+                self.assertEqual(service.run(["0"])["skip"], 1)
+                cloud.rename.assert_not_called()
+
+    def test_nfo_upgrade_preserves_external_edits_and_recovers_after_lost_publish_ack(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                service.run(["0"])
+                output = Path(directory) / 'library/DSOD-060/movie.nfo'
+                service.build_nfo = lambda info, number: b'<movie><title>Updated presentation</title></movie>'
+                published = service.registry.published
+                def lose_ack(path, data):
+                    if path.name == 'movie.nfo':
+                        raise RuntimeError('lost publish acknowledgement')
+                    published(path, data)
+                service.registry.published = lose_ack
+                self.assertEqual(service.run(["0"])["fail"], 1)
+                self.assertEqual(ET.fromstring(output.read_bytes()).findtext('title'), 'Updated presentation')
+                service.registry.published = published
+                service.close()
+                service.registry.reopen()
+                self.assertEqual(service.run(["0"])["ok"], 1)
+                self.assertEqual(service.run(["0"])["skip"], 1)
+                self.assertIsNone(service.registry._output(output.resolve())['pending'])
+                output.write_text('external edit')
+                service.build_nfo = lambda info, number: b'<movie><title>Another update</title></movie>'
+                self.assertEqual(service.run(["0"])["fail"], 1)
+                self.assertEqual(output.read_text(), 'external edit')
+
+    def test_old_pending_nfo_can_upgrade_after_restart_without_losing_ownership(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                published = service.registry.published
+                def lose_old_ack(path, data):
+                    if path.name == 'movie.nfo':
+                        raise RuntimeError('old version lost publication acknowledgement')
+                    published(path, data)
+                service.registry.published = lose_old_ack
+                self.assertEqual(service.run(["0"])["fail"], 1)
+                service.close()
+                service.registry.reopen()
+                service.registry.published = published
+                service.build_nfo = lambda info, number: b'<movie><title>New version presentation</title></movie>'
+                cloud.rename = Mock(side_effect=AssertionError('already renamed'))
+                self.assertEqual(service.run(["0"])["ok"], 1)
+                self.assertEqual(service.run(["0"])["skip"], 1)
+                path = (Path(directory) / 'library/DSOD-060/movie.nfo').resolve()
+                self.assertEqual(ET.fromstring(path.read_bytes()).findtext('title'), 'New version presentation')
+                self.assertIsNone(service.registry._output(path)['pending'])
+                cloud.rename.assert_not_called()
+
+    def test_pending_nfo_does_not_allow_overwriting_an_external_edit_on_upgrade(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                published = service.registry.published
+                def lose_ack(path, data):
+                    if path.name == 'movie.nfo':
+                        raise RuntimeError('lost acknowledgement')
+                    published(path, data)
+                service.registry.published = lose_ack
+                self.assertEqual(service.run(["0"])["fail"], 1)
+                path = Path(directory) / 'library/DSOD-060/movie.nfo'
+                path.write_text('external change after interruption')
+                service.registry.published = published
+                service.build_nfo = lambda info, number: b'<movie><title>New format</title></movie>'
+                self.assertEqual(service.run(["0"])["fail"], 1)
+                self.assertEqual(path.read_text(), 'external change after interruption')
+
     def test_subtitle_arriving_after_completed_run_is_added(self):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)

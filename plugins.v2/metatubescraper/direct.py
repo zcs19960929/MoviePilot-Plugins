@@ -111,8 +111,14 @@ class Registry:
         with self._lock, self.db:
             self.check_output(path, account, job)
             row = self._output(path)
+            confirmed = row["digest"] if row else None
+            if row and row["pending"] and path.is_file() and digest(path.read_bytes()) == row["pending"]:
+                # Publication may have succeeded before its acknowledgement was
+                # saved. Preserve that verified content before replacing pending
+                # with a new-format digest, so recovery never loses ownership.
+                confirmed = row["pending"]
             self.db.execute("INSERT OR REPLACE INTO outputs VALUES(?,?,?,?,?)",
-                            (str(path), account, job, row["digest"] if row else None, digest(data)))
+                            (str(path), account, job, confirmed, digest(data)))
 
     def published(self, path, data):
         with self._lock, self.db:
@@ -218,6 +224,20 @@ class DirectService:
         names = [Path(p["target"]).stem + ".strm" if p["kind"] == "video" else p["target"] for p in plan["files"]]
         return names + ["movie.nfo", "poster.jpg", "fanart.jpg"]
 
+    def _render_nfo(self, info, number):
+        """Use one deterministic rendering for publication and format upgrades."""
+        nfo = ET.fromstring(self.build_nfo(info, number))
+        art = nfo.find("art")
+        if art is None:
+            art = ET.SubElement(nfo, "art")
+        for kind, filename in (("poster", "poster.jpg"), ("fanart", "fanart.jpg")):
+            node = art.find(kind)
+            if node is None:
+                node = ET.SubElement(art, kind)
+            node.text = filename
+        ET.indent(nfo, space="  ")
+        return ET.tostring(nfo, encoding="utf-8", xml_declaration=True)
+
     def _check_folder(self, folder, identity):
         if (self.root.is_symlink() or self.root.resolve() != self.root or folder.is_symlink()
                 or folder.resolve().parent != self.root):
@@ -271,7 +291,10 @@ class DirectService:
         outputs = [folder / name for name in self._output_names(plan)]
         for path in outputs:
             self.registry.check_output(path, account, job)
-        if complete and not self.force and all(path.is_file() for path in outputs) and all(actual[p["entry"]["id"]].name == p["target"] for p in plan["files"]):
+        nfo_bytes = self._render_nfo(plan["metadata"], number)
+        if (complete and not self.force and all(path.is_file() for path in outputs)
+                and all(actual[p["entry"]["id"]].name == p["target"] for p in plan["files"])
+                and (folder / "movie.nfo").read_bytes() == nfo_bytes):
             return "skip"
         self.registry.save_job(account, job, plan, complete=False)
         info = plan["metadata"]
@@ -291,20 +314,12 @@ class DirectService:
                     data[name] = existing if existing is not None and not self.force else self.client.download_bytes(entry)
                     if not data[name]:
                         raise CloudError("字幕下载结果为空")
-            nfo = ET.fromstring(self.build_nfo(info, number))
-            art = nfo.find("art")
-            if art is None:
-                art = ET.SubElement(nfo, "art")
             for kind, filename in (("poster", "poster.jpg"), ("fanart", "fanart.jpg")):
-                node = art.find(kind)
-                if node is None:
-                    node = ET.SubElement(art, kind)
-                node.text = filename
                 existing = self.registry.owned_bytes(folder / filename, account, job)
                 data[filename] = existing if existing is not None and not self.force else self.artwork(info, kind)
                 if not data[filename]:
                     raise CloudError("图片下载失败：" + filename)
-            data["movie.nfo"] = ET.tostring(nfo, encoding="utf-8", xml_declaration=True)
+            data["movie.nfo"] = nfo_bytes
             for name, content in data.items():
                 self._check_folder(folder, folder_identity)
                 (stage / name).write_bytes(content)
@@ -338,6 +353,9 @@ class DirectService:
                     self._check_folder(folder, folder_identity)
                     target = folder / name
                     self.registry.check_output(target, account, job)
+                    if target.is_file() and target.read_bytes() == content:
+                        self.registry.published(target, content)
+                        continue
                     if target.exists():
                         os.replace(str(stage / name), name, dst_dir_fd=directory_fd)
                     else:

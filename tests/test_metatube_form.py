@@ -37,6 +37,30 @@ class FormTests(unittest.TestCase):
                     self.assertTrue({'cookie115', 'playback_base_url', 'cloud_interval', 'local_strm_root'} <= fields.keys())
                     self.assertIn('补齐', fields['force_overwrite']['hint'])
 
+    def test_schedule_modes_show_only_their_fields_and_retain_other_values(self):
+        all_fields = {'cron_hour', 'cron_minute', 'schedule_weekday', 'schedule_interval', 'cron_expression'}
+        visible = {
+            'manual': set(), 'daily': {'cron_hour', 'cron_minute'},
+            'weekly': {'cron_hour', 'cron_minute', 'schedule_weekday'},
+            'interval': {'schedule_interval'}, 'cron': {'cron_expression'},
+        }
+        for version in ('v2', 'v3'):
+            for mode, expected in visible.items():
+                for shape in (mode, {'value': mode}):
+                    with self.subTest(version=version, mode=shape):
+                        fields = self.render(version, schedule_mode=shape)['snapshots'][0]
+                        self.assertIn('schedule_mode', fields)
+                        self.assertEqual(all_fields & fields.keys(), expected)
+            result = self.render(version, cron_hour=0, cron_minute=0, schedule_weekday='sun',
+                                 schedule_interval=90, cron_expression='*/15 * * * *',
+                                 changes=[{'field': 'schedule_mode', 'value': 'cron'},
+                                          {'field': 'schedule_mode', 'value': {'value': 'daily'}}])
+            self.assertEqual(result['model']['cron_hour'], 0)
+            self.assertEqual(result['model']['cron_minute'], 0)
+            self.assertEqual(result['model']['schedule_weekday'], 'sun')
+            self.assertEqual(result['model']['schedule_interval'], 90)
+            self.assertEqual(result['model']['cron_expression'], '*/15 * * * *')
+
     def test_local_and_remote_mode_visibility_and_output_dependencies(self):
         for version in ('v2', 'v3'):
             with self.subTest(version=version):

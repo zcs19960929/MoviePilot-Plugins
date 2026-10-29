@@ -16,6 +16,8 @@ import tempfile
 import threading
 import xml.etree.ElementTree as ET
 from copy import copy
+from datetime import date
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,6 +25,7 @@ import requests
 
 from .direct import DirectService
 from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError
+from .schedule import build_schedule
 
 try:
     from starlette.requests import Request
@@ -239,7 +242,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.1"
+    plugin_version = "1.1.2"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -273,8 +276,8 @@ class MetaTubeScraper(_PluginBase):
     _scan_mode = "subdir"
     _file_interval = 3
     _movie_limit = 30
-    _cron_hour = 4
-    _cron_minute = 30
+    _schedule = None
+    _schedule_error = ""
     _force = False
     _download_previews = False
     _preview_limit = 10
@@ -334,8 +337,6 @@ class MetaTubeScraper(_PluginBase):
         for key, default, attr in (
             ("file_interval", 3, "_file_interval"),
             ("movie_limit", 30, "_movie_limit"),
-            ("cron_hour", 4, "_cron_hour"),
-            ("cron_minute", 30, "_cron_minute"),
             ("preview_limit", 10, "_preview_limit"),
         ):
             try:
@@ -344,8 +345,13 @@ class MetaTubeScraper(_PluginBase):
                 setattr(self, attr, default)
         self._file_interval = max(1, self._file_interval)
         self._movie_limit = max(1, self._movie_limit)
-        self._cron_hour = min(23, max(0, self._cron_hour))
-        self._cron_minute = min(59, max(0, self._cron_minute))
+        self._schedule = None
+        self._schedule_error = ""
+        try:
+            self._schedule = build_schedule(config)
+        except ValueError as error:
+            self._schedule_error = "调度配置错误：" + str(error)
+            self.warn(self._schedule_error)
         self._preview_limit = max(0, self._preview_limit)
         self._force = bool(config.get("force_overwrite"))
         self._download_previews = bool(config.get("download_previews"))
@@ -580,18 +586,50 @@ class MetaTubeScraper(_PluginBase):
                 return
             ET.SubElement(movie, tag).text = str(text).strip()
 
-        title = info.get("title") or number
-        sub("title", title)
+        title = str(info.get("title") or number).strip() or number
+        # Keep a single canonical identifier, including source titles ending in it.
+        number_pattern = r"[-_\s]*".join(re.escape(part) for part in re.split(r"[-_\s]+", number))
+        name, count = re.subn(r"(?:[\[【(（]\s*)?(?<![A-Za-z0-9])" + number_pattern
+                             + r"(?![A-Za-z0-9])(?:\s*[\]】)）])?", "", title, flags=re.I)
+        name = name.strip(" \t\r\n-_:：–—") if count else title
+        display_title = (number + " " + name).strip()
+        sub("title", display_title)
         sub("originaltitle", title)
         sub("num", number)
-        sub("plot", info.get("summary"))
-        release_date = str(info.get("release_date") or "")[:10]
+        release_date = ""
+        try:
+            released = date.fromisoformat(str(info.get("release_date") or "")[:10])
+            if released.year > 1850:  # Discard SDK zero dates; Jellyfin uses this year floor.
+                release_date = released.isoformat()
+        except ValueError:
+            pass
+        runtime = None
+        score = None
+        for key in ("runtime", "score"):
+            try:
+                value = Decimal(str(info.get(key)))
+                if not value.is_finite():
+                    continue
+                if key == "runtime" and value > 0 and value == value.to_integral_value():
+                    runtime = str(int(value))
+                elif key == "score" and 0 <= value <= 10:
+                    score = format(value.normalize(), "f")
+            except (InvalidOperation, ValueError, OverflowError):
+                pass
+        facts = [("番号", number), ("上映日期", release_date),
+                 ("片长", runtime + " 分钟" if runtime else None),
+                 ("导演", info.get("director")), ("厂商", info.get("maker")),
+                 ("发行商", info.get("label")), ("系列", info.get("series")),
+                 ("评分", score + "/10" if score is not None else None)]
+        details = "\n".join(f"{label}：{str(value).strip()}" for label, value in facts
+                            if value is not None and str(value).strip())
+        summary = str(info.get("summary") or "").strip()
+        sub("plot", details + ("\n\n" + summary if summary else ""))
         sub("premiered", release_date)
         sub("releasedate", release_date)
         if release_date and release_date[:4].isdigit():
             sub("year", release_date[:4])
-        if info.get("runtime"):
-            sub("runtime", info.get("runtime"))
+        sub("runtime", runtime)
         sub("director", info.get("director"))
         sub("studio", info.get("maker"))
         sub("label", info.get("label"))
@@ -603,13 +641,13 @@ class MetaTubeScraper(_PluginBase):
             actor_el = ET.SubElement(movie, "actor")
             ET.SubElement(actor_el, "name").text = str(actor).strip()
             ET.SubElement(actor_el, "type").text = "Actor"
-        if info.get("score"):
+        if score is not None:
             ratings = ET.SubElement(movie, "ratings")
             rating = ET.SubElement(ratings, "rating")
             rating.set("name", "metatube")
             rating.set("max", "10")
             rating.set("default", "true")
-            rating.set("value", str(info.get("score")))
+            ET.SubElement(rating, "value").text = score
         provider = info.get("provider") or ""
         movie_id = info.get("id") or ""
         if provider and movie_id:
@@ -1059,7 +1097,7 @@ class MetaTubeScraper(_PluginBase):
             )
 
     def __run_scheduled(self):
-        if self._config_ok:
+        if self._config_ok and self._schedule:
             self.__scrape_all()
 
     # ---------------- 插件契约 ----------------
@@ -1068,13 +1106,12 @@ class MetaTubeScraper(_PluginBase):
         self._stop_event.set()
 
     def get_service(self) -> List[Dict[str, Any]]:
-        if self._config_ok:
+        if self._config_ok and self._schedule:
             return [{
                 "id": "MetaTubeScraper",
                 "name": "MetaTube 番号刮削",
-                "trigger": "cron",
                 "func": self.__run_scheduled,
-                "kwargs": {"hour": self._cron_hour, "minute": self._cron_minute},
+                **self._schedule,
             }]
         return []
 
@@ -1188,9 +1225,15 @@ class MetaTubeScraper(_PluginBase):
         return {"code": 0, "msg": "刮削任务已开始，可在插件详情页或系统日志中查看进度"}
 
     def get_page(self) -> List[dict]:
+        schedule_notice = []
+        if self._schedule_error:
+            schedule_notice.append({"component": "VAlert", "props": {
+                "type": "warning", "variant": "tonal",
+                "text": self._schedule_error + "。定时任务未启用，仍可手动执行；修改后请保存。",
+            }})
         stats = self.get_data("last_run")
         if not stats:
-            return [{
+            return schedule_notice + [{
                 "component": "VAlert",
                 "props": {
                     "type": "info",
@@ -1204,7 +1247,7 @@ class MetaTubeScraper(_PluginBase):
                 f"未找到: {stats.get('notfound', 0)} | 失败: {stats.get('fail', 0)}")
         if stats.get("errors"):
             text += " | 错误：" + "；".join(stats["errors"][-3:])
-        return [{
+        return schedule_notice + [{
             "component": "VAlert",
             "props": {
                 "type": "success" if stats.get("fail", 0) == 0 else "warning",
@@ -1226,6 +1269,8 @@ class MetaTubeScraper(_PluginBase):
         mapped = f"({remote} && write_local)"
         moving = f"({writable} && organize)"
         legacy = f"(!{direct})"
+        schedule = "((schedule_mode && typeof schedule_mode === 'object') ? schedule_mode.value : (schedule_mode || 'daily'))"
+        timed = f"({schedule} === 'daily' || {schedule} === 'weekly')"
 
         def expr(code):
             return "{{ " + code + " }}"
@@ -1346,9 +1391,28 @@ class MetaTubeScraper(_PluginBase):
                 }}),
                 text("file_interval", "兼容模式读写间隔（秒）", "3", "受控读写前的等待时间，不是风控安全保证", show=legacy)),
             row(text("movie_limit", "单次处理影片上限", "30", "每轮处理上限，剩余影片下次继续"),
-                col({"component": "VRow", "content": [
-                    text("cron_hour", "定时-时（0–23）", md=6), text("cron_minute", "定时-分（0–59）", md=6),
-                ]})),
+                col({"component": "VSelect", "props": {
+                    "model": "schedule_mode", "label": "调度方式", "returnObject": False,
+                    "items": [
+                        {"title": "仅手动执行", "value": "manual"},
+                        {"title": "每天", "value": "daily"},
+                        {"title": "每周", "value": "weekly"},
+                        {"title": "每隔 N 分钟", "value": "interval"},
+                        {"title": "自定义 Cron", "value": "cron"},
+                    ], "hint": "按 MoviePilot 宿主时区执行；修改后先保存。仅手动不影响已有 STRM 播放。", "persistent-hint": True,
+                }})),
+            row(col({"component": "VSelect", "props": {
+                    "model": "schedule_weekday", "label": "执行星期", "returnObject": False,
+                    "items": [{"title": "周" + title, "value": value} for title, value in
+                              zip("一二三四五六日", ("mon", "tue", "wed", "thu", "fri", "sat", "sun"))],
+                }}, md=4, show=f"{schedule} === 'weekly'"),
+                text("cron_hour", "执行小时（0–23）", md=4, show=timed, type="number", min=0, max=23),
+                text("cron_minute", "执行分钟（0–59）", md=4, show=timed, type="number", min=0, max=59)),
+            row(text("schedule_interval", "执行间隔（分钟）", "60", "1–525600 的整数；从任务注册时起计时，重载配置后重新计时", md=12,
+                     show=f"{schedule} === 'interval'", type="number", min=1, max=525600)),
+            row(text("cron_expression", "Cron 表达式（五段）", "30 4 * * *",
+                     "分 时 日 月 星期；30 4 * * * = 每天 04:30；*/30 * * * * = 每半小时；0 4 * * mon = 每周一 04:00。星期 0=周一、6=周日，建议 mon–sun。", md=12,
+                     show=f"{schedule} === 'cron'")),
             row(switch("enabled", "启用插件"),
                 switch("force_overwrite", expr(f"{direct} ? '重新获取元数据、图片和字幕' : '覆盖已有 NFO 和图片'"),
                        expr(f"{direct} ? '关闭时仍会补齐缺失文件；开启后也只更新本插件拥有且未被修改的文件，不接管外部文件' : '关闭时跳过已有 movie.nfo 的影片目录；开启后可能覆盖已有 NFO 和图片'"))),
@@ -1370,6 +1434,7 @@ class MetaTubeScraper(_PluginBase):
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
             "organize": False, "trigger_strm": True, "scan_mode": "subdir", "file_interval": 3,
             "movie_limit": 30, "cron_hour": 4, "cron_minute": 30, "force_overwrite": False,
+            "schedule_mode": "daily", "schedule_weekday": "mon", "schedule_interval": 60, "cron_expression": "30 4 * * *",
             "download_previews": False, "preview_limit": 10, "rename_files": False, "numeric_ids": False,
         }
         return form, data
