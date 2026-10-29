@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from .direct import DirectService
-from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError
+from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError, Stopped
 from .schedule import build_schedule
 
 try:
@@ -195,12 +195,23 @@ JS_SELFTEST = """async () => {
 }"""
 
 JS_CHECK115 = """async () => {
-  run_msg = '正在检查 115 Cookie…';
+  if (cookie115_checking) return;
+  const request = cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
+  const isCurrent = () => cookie115_check_id === request;
+  cookie115_checking = true; cookie115_msg = '正在检查已保存的 115 Cookie…';
   try {
     const r = await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/check');
     const d = (r && r.data && r.data.code !== undefined) ? r.data : r;
-    run_msg = (d && d.msg) || '未返回检查结果';
-  } catch (e) { run_msg = '检查失败，请确认已保存 Cookie 和插件依赖可用'; }
+    if (isCurrent()) cookie115_msg = (d && d.msg) || '未返回检查结果';
+  } catch (e) {
+    if (isCurrent()) cookie115_msg = '检查失败，请确认已保存 Cookie 和插件依赖可用';
+  } finally { if (isCurrent()) cookie115_checking = false; }
+}"""
+
+JS_COOKIE_CHANGE = """(value) => {
+  cookie115 = value || '';
+  cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
+  cookie115_msg = ''; cookie115_checking = false;
 }"""
 
 JS_RUN = """async () => {
@@ -231,6 +242,8 @@ JS_STORAGE_CHANGE = """(value) => {
   storage = (value && typeof value === 'object') ? (value.value || value.title || 'local') : (value || 'local');
   browse_path = '/'; dir_parent = 'id:0'; dir_items = []; pick_dir = null;
   dir_loading = false; run_msg = '';
+  cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
+  cookie115_msg = ''; cookie115_checking = false;
   dir_error = '存储已切换，请重新确认扫描目录后保存；已填参数保留，不会自动转换路径。';
 }"""
 
@@ -242,7 +255,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.2"
+    plugin_version = "1.1.3"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -293,14 +306,26 @@ class MetaTubeScraper(_PluginBase):
     _cloud115 = None
     _direct_service = None
     _direct_lock = threading.RLock()
+    _config_loaded = False
 
     def init_plugin(self, config: dict = None):
-        if self._running:
-            self._stop_event.set()
         with self._direct_lock:
-            self.__apply_config(config)
+            # Normalize on an isolated settings copy. Compare only assignments
+            # made by the parser, never concurrently changing worker state.
+            candidate = copy(self)
+            before = vars(candidate).copy()
+            candidate.__read_config(config)
+            changes = {key: value for key, value in vars(candidate).items()
+                       if key not in before or (before[key] is not value and before[key] != value)}
+            execution_changes = changes.keys() - {"_schedule", "_schedule_error"}
+            if not self._config_loaded or execution_changes or self._stop_event.is_set():
+                if self._running:
+                    self._stop_event.set()
+                self.__reset_context()
+            self.__dict__.update(changes)
+            self._config_loaded = True
 
-    def __apply_config(self, config: dict = None):
+    def __reset_context(self):
         # Stop the old background context before replacing credentials/settings.
         old_client = getattr(self, "_cloud115", None)
         if old_client is not None:
@@ -317,6 +342,9 @@ class MetaTubeScraper(_PluginBase):
         self._cloud115 = None
         self._direct_service = None
         self._stop_event = threading.Event()
+        self._upload_unsupported = False
+
+    def __read_config(self, config: dict = None):
         config = config or {}
         self._enabled = bool(config.get("enabled"))
         self._url = _pick_str(config.get("metatube_url"))
@@ -374,7 +402,6 @@ class MetaTubeScraper(_PluginBase):
             self._write_remote = self._organize = self._trigger_strm = False
         elif self._storage == "115Lite":
             self._write_remote = self._organize = False
-        self._upload_unsupported = False
 
     @property
     def _config_errors(self) -> List[str]:
@@ -1038,19 +1065,24 @@ class MetaTubeScraper(_PluginBase):
     # ---------------- 任务 ----------------
 
     def __scrape_all(self):
-        with self._lock:
+        with self._direct_lock, self._lock:
             if self._running:
                 self.warn("上一次刮削任务尚未结束，本次跳过")
                 return
             self._running = True
-        self._stop_event.clear()
-        stats = {"total": 0, "ok": 0, "skip": 0, "nomatch": 0,
-                 "notfound": 0, "fail": 0, "time": "", "storage": self._storage}
+            self._stop_event.clear()
+            task_stop_event = self._stop_event
+            stats = {"total": 0, "ok": 0, "skip": 0, "nomatch": 0,
+                     "notfound": 0, "fail": 0, "time": "", "storage": self._storage}
         try:
             self.info(f"MetaTube 番号刮削开始，存储: {self._storage}，目录: {self._scan_dirs}")
-            if self._storage == "115_direct":
-                result = self.__get_direct_service().run(
-                    self._scan_dirs, recursive=self._scan_mode == "recursive", limit=self._movie_limit)
+            if stats["storage"] == "115_direct":
+                with self._direct_lock:
+                    if task_stop_event.is_set() or self._stop_event is not task_stop_event:
+                        raise Stopped("配置已更新，任务已停止")
+                    service = self.__get_direct_service()
+                    roots, recursive, limit = list(self._scan_dirs), self._scan_mode == "recursive", self._movie_limit
+                result = service.run(roots, recursive=recursive, limit=limit)
                 stats.update(result)
                 for message in result.get("errors", []):
                     self.warn(message)
@@ -1061,7 +1093,7 @@ class MetaTubeScraper(_PluginBase):
             stats["total"] = len(targets)
             self.info(f"共发现 {len(targets)} 个待处理目录")
             for t in targets:
-                if self._stop_event.is_set():
+                if task_stop_event.is_set():
                     self.warn("任务被手动停止")
                     break
                 handled = stats["ok"] + stats["notfound"] + stats["fail"]
@@ -1070,6 +1102,8 @@ class MetaTubeScraper(_PluginBase):
                     break
                 status = self.__process_target(t)
                 stats[status] = stats.get(status, 0) + 1
+        except Stopped:
+            stats["stopped"] = True
         except (AuthenticationError, RiskError) as e:
             stats.update(getattr(e, "stats", {}))
             stats["fail"] += 1
@@ -1077,11 +1111,15 @@ class MetaTubeScraper(_PluginBase):
             self.error(str(e))
         except Exception as e:
             stats["fail"] += 1
-            if self._storage == "115_direct":
+            if stats["storage"] == "115_direct":
                 message = str(e) if isinstance(e, CloudError) else type(e).__name__
                 stats.setdefault("errors", []).append(message)
             self.error(f"刮削任务异常: {e}")
         finally:
+            if task_stop_event.is_set():
+                stats["stopped"] = True
+            if stats.get("stopped"):
+                stats["stop_reason"] = "配置更新、插件停用或重载已停止本次任务；保存完成后可重新执行。"
             self._running = False
             with self._direct_lock:
                 for retired in getattr(self, "_retired_services", []):
@@ -1090,10 +1128,12 @@ class MetaTubeScraper(_PluginBase):
             from datetime import datetime
             stats["time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.save_data("last_run", stats)
+            outcome = "已停止" if stats.get("stopped") else "完成"
             self.info(
-                f"MetaTube 番号刮削完成: 共 {stats['total']} 个目录, "
+                f"MetaTube 番号刮削{outcome}: 共 {stats['total']} 个目录, "
                 f"成功 {stats['ok']}, 跳过 {stats['skip']}, "
                 f"未识别 {stats['nomatch']}, 未找到 {stats['notfound']}, 失败 {stats['fail']}"
+                + ("；" + stats["stop_reason"] if stats.get("stopped") else "")
             )
 
     def __run_scheduled(self):
@@ -1241,16 +1281,19 @@ class MetaTubeScraper(_PluginBase):
                     "text": "暂无运行记录，配置完成后可通过「立即执行刮削」按钮触发一次任务。",
                 },
             }]
-        text = (f"运行时间: {stats.get('time', '-')} | 存储: {stats.get('storage', '-')} | "
+        state = "已停止" if stats.get("stopped") else "已完成"
+        text = (f"状态: {state} | 运行时间: {stats.get('time', '-')} | 存储: {stats.get('storage', '-')} | "
                 f"扫描目录: {stats.get('total', 0)} | 成功: {stats.get('ok', 0)} | "
                 f"跳过: {stats.get('skip', 0)} | 未识别: {stats.get('nomatch', 0)} | "
                 f"未找到: {stats.get('notfound', 0)} | 失败: {stats.get('fail', 0)}")
         if stats.get("errors"):
             text += " | 错误：" + "；".join(stats["errors"][-3:])
+        if stats.get("stop_reason"):
+            text += " | " + stats["stop_reason"]
         return schedule_notice + [{
             "component": "VAlert",
             "props": {
-                "type": "success" if stats.get("fail", 0) == 0 else "warning",
+                "type": "success" if stats.get("fail", 0) == 0 and not stats.get("stopped") else "warning",
                 "variant": "tonal",
                 "text": text,
             },
@@ -1307,8 +1350,8 @@ class MetaTubeScraper(_PluginBase):
                 props["show"] = expr(show)
             return {"component": "VAlert", "props": props}
 
-        def button(label, script, show=None, icon=None):
-            props = {"variant": "tonal", "size": "small", "color": "primary", "onClick": script}
+        def button(label, script, show=None, icon=None, **extra):
+            props = {"variant": "tonal", "size": "small", "color": "primary", "onClick": script, **extra}
             if icon:
                 props["prepend-icon"] = icon
             return col({"component": "VBtn", "props": props, "text": label}, md=4, show=show)
@@ -1338,14 +1381,16 @@ class MetaTubeScraper(_PluginBase):
             alert("115Lite 兼容模式不支持元数据上传和本插件的自动归位；可写本地 NFO/图片，并通知 115Lite 生成 STRM。", lite),
             alert("通过 MoviePilot 存储接口读写；上传、移动是否可用取决于所选存储。", writable),
             row(text("cookie115", "115 Cookie", tip="可复用 115Lite Cookie；与 MetaTube Token 不同。修改后先保存再检查。",
-                     md=12, show=direct, type="password")),
+                     md=12, show=direct, type="password", **{"onUpdate:modelValue": JS_COOKIE_CHANGE})),
+            row(button("检查已保存的 115 Cookie", JS_CHECK115, show=direct,
+                       loading=expr("cookie115_checking"), disabled=expr("cookie115_checking")),
+                text("cookie115_msg", "Cookie 检查结果", md=8, show=f"{direct} && !!cookie115_msg", readonly=True, variant="plain")),
             row(
                 text("playback_base_url", "MoviePilot 播放入口地址", "https://mp.example.com",
                      "填写 Emby/播放器可访问的 MoviePilot 地址；播放时由本插件 302 跳转到 115", show=direct),
                 text("cloud_interval", "115 后台请求间隔（秒）", "5",
                      "串行读取、改名和字幕取链的请求间隔；不保证固定间隔绝对安全", show=direct),
             ),
-            row(button("检查已保存的 115 Cookie", JS_CHECK115, show=direct)),
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2"}, "content": [
                 {"component": "VCardText", "content": [
                     row(text("browse_path", "当前浏览路径", "/",
@@ -1429,6 +1474,7 @@ class MetaTubeScraper(_PluginBase):
             "enabled": False, "metatube_url": "", "metatube_token": "",
             "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub", "storage": "115_direct",
             "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
+            "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",

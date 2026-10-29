@@ -1,12 +1,13 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.1.2",
+    "version": "1.1.3",
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
     "v3": true,
     "history": {
+      "v1.1.3": "Cookie 检查结果就近显示并防止重复检查；修复保存相同配置或仅调整调度会中断任务，将正常停止与真实刮削失败区分显示。",
       "v1.1.2": "新增手动/每天/每周/间隔/Cron 调度，兼容旧配置并修复零点整点；NFO 标题加番号，简介补充上映日期等资料，安全更新已有直连 NFO。",
       "v1.1.1": "配置项按存储类型即时联动，隐藏无效开关；检查有效输出和目录映射，保留已填参数；补全 1.1.0 升级说明。",
       "v1.1.0": "新增 115 Cookie 独立访问、视频字幕关联改名、本地 STRM/字幕/NFO/图片生成、SQLite 续跑及稳定 302 播放入口；直连模式要求 Python 3.12+。",

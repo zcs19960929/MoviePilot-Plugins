@@ -20,11 +20,28 @@ class FormTests(unittest.TestCase):
         form, model = load_plugin(version, Mock()).get_form()
         changes = values.pop('changes', [])
         async_browse = values.pop('async_browse', None)
+        cookie_check = values.pop('cookie_check', None)
         model.update(values)
         reply = subprocess.run([NODE, str(HERE / 'form_model.js')],
-                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse)),
+                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check)),
                                capture_output=True, text=True, check=True)
         return json.loads(reply.stdout)
+
+    def test_cookie_check_has_its_own_nearby_result_and_loading_state(self):
+        for version in ('v2','v3'):
+            for reject in (False,True):
+                result=self.render(version,run_msg='existing scrape result',cookie_check={'reject':reject})
+                self.assertEqual(result['model']['run_msg'],'existing scrape result')
+                self.assertEqual(result['intermediate'],{'loading':True,'requests':1})
+                self.assertFalse(result['model']['cookie115_checking'])
+                self.assertIn('cookie115_msg',result['snapshots'][-1])
+                self.assertIn('失败' if reject else 'Cookie 可用',result['model']['cookie115_msg'])
+
+    def test_cookie_check_discards_a_result_after_mode_or_cookie_change(self):
+        for change in ('switchMode','editCookie'):
+            result=self.render(cookie_check={change:True})
+            self.assertEqual(result['model']['cookie115_msg'],'')
+            self.assertFalse(result['model']['cookie115_checking'])
 
     def test_direct_hides_legacy_actions_in_both_combobox_shapes(self):
         hidden = {'write_local', 'write_remote', 'remote_lib_root', 'organize', 'trigger_strm',

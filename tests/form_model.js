@@ -1,6 +1,6 @@
 // Exercise the plugin schema using the host FormRender's expression/event contract.
 const fs = require('node:fs');
-const { form, model, changes = [], asyncBrowse } = JSON.parse(fs.readFileSync(0, 'utf8'));
+const { form, model, changes = [], asyncBrowse, cookieCheck } = JSON.parse(fs.readFileSync(0, 'utf8'));
 const expression = value => typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}');
 const evaluate = value => expression(value)
   ? new Function('model', `with(model) { return ${value.slice(2, -2)} }`)(model)
@@ -42,6 +42,23 @@ for (const { field, value } of changes) {
   snapshots.push(visit(form));
 }
 let intermediate;
+if (cookieCheck) {
+  const pending=[];
+  global.window={MoviePilotAPI:{get:()=>new Promise((resolve,reject)=>pending.push({resolve,reject}))}};
+  const source=button(form,'检查已保存的 115 Cookie').props.onClick;
+  const task=execute(source);
+  const second=execute(source); // The loading button must not issue a duplicate request.
+  intermediate={loading:model.cookie115_checking,requests:pending.length};
+  if(cookieCheck.switchMode) execute(find(form,'storage').props['onUpdate:modelValue'],'local');
+  if(cookieCheck.editCookie) execute(find(form,'cookie115').props['onUpdate:modelValue'],'updated fixture');
+  for(const request of pending) {
+    if(cookieCheck.reject)request.reject(new Error('network error'));
+    else request.resolve({data:{code:0,msg:'115 Cookie 可用'}});
+  }
+  await task;
+  await second;
+  snapshots.push(visit(form));
+}
 if (asyncBrowse) {
   const pending = [];
   global.window = { MoviePilotAPI: Object.fromEntries(['get', 'post'].map(method =>

@@ -371,10 +371,15 @@ class DirectService:
     def run(self, roots, recursive=False, limit=30, max_depth=3):
         stats = dict(total=0, ok=0, skip=0, nomatch=0, notfound=0, fail=0, errors=[])
         try:
-            return self._run(roots, recursive, limit, max_depth, stats)
+            self._run(roots, recursive, limit, max_depth, stats)
         except (AuthenticationError, RiskError) as exc:
             exc.stats = stats
             raise
+        except Stopped:
+            stats["stopped"] = True
+        if self.stop_event.is_set():
+            stats["stopped"] = True
+        return stats
 
     def _run(self, roots, recursive, limit, max_depth, stats):
         if self.stop_event.is_set():
@@ -411,7 +416,7 @@ class DirectService:
                 except (AuthenticationError, RiskError):
                     raise
                 except Stopped:
-                    return stats
+                    raise
                 except Exception as exc:
                     status = "fail"
                     message = str(exc) if isinstance(exc, CloudError) else type(exc).__name__

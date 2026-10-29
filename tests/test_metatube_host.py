@@ -10,6 +10,94 @@ import test_metatube_direct as fixtures
 
 
 class HostTests(unittest.TestCase):
+    def test_configuration_reload_before_client_creation_cancels_the_original_job(self):
+        for version in ('v2','v3'):
+            plugin=load_plugin(version,Mock())
+            config=dict(enabled=True,storage='115_direct',cookie115='account-A',metatube_url='http://backend',
+                        scan_dirs='id:0',local_strm_root='/tmp/output',playback_base_url='https://mp.example')
+            plugin.init_plugin(config)
+            records=[];plugin.save_data=lambda key,value:records.append(value)
+            def reload_after_start(message):
+                if '刮削开始' in message:plugin.init_plugin(dict(config,cookie115='account-B'))
+            plugin.info=reload_after_start
+            plugin._MetaTubeScraper__scrape_all()
+            self.assertEqual(records[-1]['fail'],0)
+            self.assertTrue(records[-1]['stopped'])
+
+    def test_saving_ui_or_schedule_settings_does_not_cancel_an_active_scan(self):
+        for version in ('v2', 'v3'):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                fixture = fixtures.DirectAcceptanceTests()
+                fixture.addCleanup = self.addCleanup
+                m, cloud, metadata, service = fixture.make(directory, version)
+                plugin = load_plugin(version, Mock())
+                _, config = plugin.get_form()
+                config.update(enabled=True, storage='115_direct', cookie115='fixture',
+                              metatube_url='http://backend', scan_dirs='id:0',
+                              local_strm_root=str(Path(directory)/'library'), playback_base_url='https://mp.example')
+                plugin.init_plugin(config)
+                cloud.stop_event = service.stop_event = plugin._stop_event
+                plugin._cloud115, plugin._direct_service = cloud, service
+                entered, release = threading.Event(), threading.Event()
+                original_listdir = cloud.listdir
+                def waiting_listdir(cid):
+                    entered.set()
+                    if not release.wait(3): raise RuntimeError('test did not release scan')
+                    if cloud.stop_event.is_set(): raise m.Stopped('任务已停止')
+                    return original_listdir(cid)
+                cloud.listdir = waiting_listdir
+                records = []
+                plugin.save_data = lambda key, value: records.append(value)
+                worker = threading.Thread(target=plugin._MetaTubeScraper__scrape_all)
+                worker.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    plugin.init_plugin(dict(config, run_msg='运行中', cookie115_msg='Cookie 可用',
+                                            storage={'value':'115_direct'}, cron_hour='4',
+                                            schedule_mode='interval', schedule_interval=90))
+                    self.assertFalse(cloud.stop_event.is_set())
+                finally:
+                    release.set(); worker.join(4)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(records[-1]['ok'], 1)
+                self.assertEqual(records[-1]['fail'], 0)
+                self.assertTrue((Path(directory)/'library/DSOD-060/movie.nfo').is_file())
+                self.assertEqual(plugin.get_service()[0]['kwargs'], {'minutes':90})
+
+    def test_real_configuration_change_stops_scan_without_reporting_scrape_failure(self):
+        for version in ('v2', 'v3'):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                fixture = fixtures.DirectAcceptanceTests(); fixture.addCleanup = self.addCleanup
+                m, cloud, metadata, service = fixture.make(directory, version)
+                plugin = load_plugin(version, Mock())
+                config=dict(enabled=True, storage='115_direct', cookie115='account-A', metatube_url='http://backend',
+                            scan_dirs='id:0', local_strm_root=str(Path(directory)/'library'), playback_base_url='https://mp.example')
+                plugin.init_plugin(config)
+                cloud.stop_event = service.stop_event = plugin._stop_event
+                plugin._cloud115, plugin._direct_service = cloud, service
+                entered, release = threading.Event(), threading.Event()
+                def waiting_listdir(cid):
+                    entered.set()
+                    if not release.wait(3): raise RuntimeError('test did not release scan')
+                    if cloud.stop_event.is_set(): raise m.Stopped('任务已停止')
+                    return []
+                cloud.listdir = waiting_listdir
+                records=[]; plugin.save_data=lambda key,value:records.append(value)
+                worker=threading.Thread(target=plugin._MetaTubeScraper__scrape_all);worker.start()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    plugin.init_plugin(dict(config,cookie115='account-B'))
+                    self.assertTrue(cloud.stop_event.is_set())
+                finally:
+                    release.set();worker.join(4)
+                self.assertEqual(records[-1]['fail'],0)
+                self.assertTrue(records[-1]['stopped'])
+                self.assertFalse((Path(directory)/'library/DSOD-060/movie.nfo').exists())
+                plugin.get_data=lambda key:records[-1]
+                page=plugin.get_page()
+                self.assertIn('已停止',str(page))
+                self.assertEqual(page[-1]['props']['type'],'warning')
+
     def test_account_reload_serializes_with_client_creation_and_stops_old_context(self):
         plugin = load_plugin("v3", Mock())
         plugin.init_plugin({"cookie115": "account-A", "storage": "115_direct"})

@@ -121,6 +121,32 @@ class DirectAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.run(["0"])["notfound"], 1)
             self.assertEqual(cloud.renames, [])
 
+    def test_stop_during_root_resolution_and_listing_is_a_cancelled_result(self):
+        for version in ('v2','v3'):
+            for stage in ('resolve_folder','info','listdir'):
+                with self.subTest(version=version,stage=stage),tempfile.TemporaryDirectory() as directory:
+                    m,cloud,metadata,service=self.make(directory,version)
+                    setattr(cloud,stage,Mock(side_effect=m.Stopped('任务已停止')))
+                    result=service.run(['7' if stage=='info' else '0'])
+                    self.assertEqual(result['fail'],0)
+                    self.assertTrue(result['stopped'])
+                    self.assertEqual(cloud.renames,[])
+
+    def test_stop_after_a_completed_film_preserves_progress(self):
+        for version in ('v2','v3'):
+            with self.subTest(version=version),tempfile.TemporaryDirectory() as directory:
+                m,cloud,metadata,service=self.make(directory,version)
+                cloud.entries['10']=m.Entry('10','0','next folder',is_dir=True)
+                original=cloud.listdir
+                def stop_in_child(cid):
+                    if str(cid)=='10':raise m.Stopped('任务已停止')
+                    return original(cid)
+                cloud.listdir=stop_in_child
+                result=service.run(['0'])
+                self.assertTrue(result['stopped'])
+                self.assertEqual((result['ok'],result['fail']),(1,0))
+                self.assertTrue((Path(directory)/'library/DSOD-060/movie.nfo').is_file())
+
     def test_owned_nfo_format_upgrade_uses_cache_without_cloud_writes_or_downloads(self):
         for version in ("v2", "v3"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
