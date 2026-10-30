@@ -1,12 +1,13 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.1.4",
+    "version": "1.1.5",
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
     "v3": true,
     "history": {
+      "v1.1.5": "扫描目录改用弹窗选择，点击文件夹进入并确认添加；取消不改变扫描范围，保留中文路径、稳定 ID 和已有配置。",
       "v1.1.4": "115 Cookie 直连显示中文目录路径和扫描标签，后台保留稳定 ID；导航失败保留原位置，兼容旧配置，无额外父目录请求。",
       "v1.1.3": "Cookie 检查结果就近显示并防止重复检查；修复保存相同配置或仅调整调度会中断任务，将正常停止与真实刮削失败区分显示。",
       "v1.1.2": "新增手动/每天/每周/间隔/Cron 调度，兼容旧配置并修复零点整点；NFO 标题加番号，简介补充上映日期等资料，安全更新已有直连 NFO。",

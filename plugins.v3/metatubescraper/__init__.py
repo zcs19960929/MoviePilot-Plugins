@@ -109,7 +109,7 @@ JS_SCAN_VALUES = "(Array.isArray(scan_dirs) ? scan_dirs : String(scan_dirs || ''
 
 JS_BROWSE_CHANGE = """(value) => {
   browse_display_path = value || '/'; browse_path = browse_display_path;
-  dir_items = []; pick_dir = null; dir_loading = false; dir_error = '';
+  dir_items = []; pick_dir = null; dir_loading = false; dir_ready = false; dir_error = '';
 }"""
 
 JS_SCAN_CHANGE = """(values) => {
@@ -118,10 +118,10 @@ JS_SCAN_CHANGE = """(values) => {
 }"""
 
 JS_LOAD = """async () => {
-  dir_items = [];
+  dir_items = []; dir_page = 1;
   const requestItems = dir_items;
   const isCurrent = () => dir_items === requestItems;
-  dir_loading = true; dir_error = '';
+  dir_loading = true; dir_ready = false; dir_error = '';
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
     const p = (browse_path || '/').trim() || '/';
@@ -141,6 +141,7 @@ JS_LOAD = """async () => {
       browse_display_path = d.display_path || labels[d.path] || browse_display_path || '/';
     }
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
+    dir_ready = true;
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
     if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
@@ -151,10 +152,10 @@ JS_ENTER = """async (v) => {
   const path = (v && v.value) ? v.value : v;
   if (!path) return;
   pick_dir = null;
-  dir_items = [];
+  dir_items = []; dir_page = 1;
   const requestItems = dir_items;
   const isCurrent = () => dir_items === requestItems;
-  dir_loading = true; dir_error = '';
+  dir_loading = true; dir_ready = false; dir_error = '';
   try {
     const st = (storage && storage.value) ? storage.value : (storage || 'local');
     const r = st === '115_direct'
@@ -174,6 +175,7 @@ JS_ENTER = """async (v) => {
     }
     if (st !== '115_direct') browse_path = path;
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
+    dir_ready = true;
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
     if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
@@ -186,10 +188,10 @@ JS_UP = """async () => {
   const i = p.lastIndexOf('/');
   const target = st === '115_direct' ? (dir_parent || 'id:0') : (i <= 0 ? '/' : p.slice(0, i));
   pick_dir = null;
-  dir_items = [];
+  dir_items = []; dir_page = 1;
   const requestItems = dir_items;
   const isCurrent = () => dir_items === requestItems;
-  dir_loading = true; dir_error = '';
+  dir_loading = true; dir_ready = false; dir_error = '';
   try {
     const r = st === '115_direct'
       ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(target))
@@ -208,6 +210,8 @@ JS_UP = """async () => {
     }
     if (st !== '115_direct') browse_path = target;
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
+    dir_ready = true;
+    if (!dir_items.length) dir_error = '该目录下没有子目录';
   } catch (e) {
     if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
   } finally { if (isCurrent()) dir_loading = false; }
@@ -249,6 +253,7 @@ JS_COOKIE_CHANGE = """(value) => {
   cookie115_msg = ''; cookie115_checking = false;
   dir_labels = {}; dir_items = []; pick_dir = null;
   browse_path = '/'; browse_display_path = '/'; dir_parent = 'id:0';
+  dir_picker_open = false; dir_ready = false;
   dir_loading = false; dir_error = 'Cookie 已修改，请先保存，再重新浏览确认扫描目录。';
 }"""
 
@@ -268,24 +273,43 @@ JS_RUN = """async () => {
 }"""
 
 JS_ADD = """() => {
-  if (dir_loading) { dir_error = '目录读取中，请稍候再添加'; return; }
+  if (dir_loading) { dir_error = '目录读取中，请稍候再添加'; return false; }
   const p = (browse_path || '').trim();
-  if (!p) { dir_error = '请先输入或选择路径'; return; }
+  if (!p) { dir_error = '请先输入或选择路径'; return false; }
   const st = (storage && storage.value) ? storage.value : storage;
   if (st === '115_direct' && p.startsWith('id:') && p !== 'id:0' && !(dir_labels || {})[p]) {
-    dir_error = '请先读取目录，确认名称后再添加'; return;
+    dir_error = '请先读取目录，确认名称后再添加'; return false;
   }
   const cur = (Array.isArray(scan_dirs) ? scan_dirs : String(scan_dirs || '').split(/[\\n,;]+/))
     .map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean);
   if (cur.indexOf(p) === -1) { cur.push(p); }
   scan_dirs = cur.join('\\n');
   dir_error = '已添加：' + (st === '115_direct' ? ((dir_labels || {})[p] || (p === 'id:0' ? '/' : p)) : p);
+  return true;
 }"""
+
+# 弹窗只负责选择；确认前不修改 scan_dirs。替换列表会让关闭前的异步请求失效。
+JS_PICK_CLOSE = """() => {
+  dir_picker_open = false; dir_items = []; pick_dir = null; dir_page = 1;
+  dir_loading = false; dir_ready = false; dir_error = '';
+}"""
+JS_PICK_OPEN = "async () => { dir_picker_open = true; await (" + JS_LOAD + ")(); }"
+JS_PICK_TOGGLE = "(value) => { if (!value) (" + JS_PICK_CLOSE + ")(); else dir_picker_open = true; }"
+JS_PICK_CONFIRM = """() => {
+  if (dir_loading || !dir_ready) {
+    if (!dir_error) dir_error = '请先读取目录，再选择当前目录';
+    return;
+  }
+  if ((""" + JS_ADD + ")()) (" + JS_PICK_CLOSE + ")(); }"
+JS_PICK_NAV = """async (values) => {
+  const value = Array.isArray(values) ? values[0] : values;
+  if (!value) return;
+  if (value === '__parent__') await (""" + JS_UP + ")(); else await (" + JS_ENTER + ")(value); }"
 
 JS_STORAGE_CHANGE = """(value) => {
   storage = (value && typeof value === 'object') ? (value.value || value.title || 'local') : (value || 'local');
   browse_path = '/'; browse_display_path = '/'; dir_parent = 'id:0'; dir_items = []; pick_dir = null;
-  dir_loading = false; run_msg = '';
+  dir_loading = false; dir_ready = false; dir_picker_open = false; run_msg = '';
   cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
   cookie115_msg = ''; cookie115_checking = false;
   dir_error = '存储已切换，请重新确认扫描目录后保存；已填参数保留，不会自动转换路径。';
@@ -299,7 +323,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.4"
+    plugin_version = "1.1.5"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -1400,11 +1424,11 @@ class MetaTubeScraper(_PluginBase):
                 props["show"] = expr(show)
             return {"component": "VAlert", "props": props}
 
-        def button(label, script, show=None, icon=None, **extra):
+        def button(label, script, show=None, icon=None, md=4, **extra):
             props = {"variant": "tonal", "size": "small", "color": "primary", "onClick": script, **extra}
             if icon:
                 props["prepend-icon"] = icon
-            return col({"component": "VBtn", "props": props, "text": label}, md=4, show=show)
+            return col({"component": "VBtn", "props": props, "text": label}, md=md, show=show)
 
         form = [{"component": "VForm", "content": [
             alert("检查、浏览和执行均使用已保存配置；修改后请先保存。切换存储不会清空已填参数。"),
@@ -1441,39 +1465,65 @@ class MetaTubeScraper(_PluginBase):
                 text("cloud_interval", "115 后台请求间隔（秒）", "5",
                      "串行读取、改名和字幕取链的请求间隔；不保证固定间隔绝对安全", show=direct),
             ),
-            {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2"}, "content": [
-                {"component": "VCardText", "content": [
-                    row(text("browse_path", "当前浏览路径", "/",
-                             expr(f"{local} ? '填写容器内绝对路径' : '填写所选存储内的路径，如 /jav'"), md=12, show=legacy),
-                        text("browse_display_path", "当前浏览路径", "读取目录后显示名称",
-                             "显示目录名称；后台按稳定 ID 定位。可输入路径后点击读取，旧 ID 浏览后会显示名称。", md=12, show=direct,
-                             **{"onUpdate:modelValue": JS_BROWSE_CHANGE,
-                                "modelValue": expr("String(browse_path || '/').startsWith('id:') ? (browse_display_path === browse_path ? browse_display_path : ((dir_labels || {})[browse_path] || (browse_path === 'id:0' ? '/' : ''))) : (browse_path || '/')")})),
-                    row(button("读取目录", JS_LOAD, icon="mdi-folder-refresh"),
-                        button("上一级", JS_UP, icon="mdi-arrow-up-bold"),
-                        button("添加为扫描目录", JS_ADD, icon="mdi-plus", disabled=expr("dir_loading"))),
-                    row(col({"component": "VSelect", "props": {
-                            "model": "pick_dir", "label": "子目录（选择后自动进入）", "items": "{{ dir_items }}",
-                            "itemTitle": "title", "itemValue": "value", "returnObject": False,
-                            "clearable": True, "onUpdate:modelValue": JS_ENTER,
-                        }}, md=8),
-                        text("dir_error", "浏览状态", md=4, readonly=True, variant="plain")),
-                ]},
-            ]},
             row(col({"component": "VCombobox", "props": {
                 "model": "scan_dirs", "label": "扫描目录（可多选）",
                 "modelValue": expr(JS_SCAN_VALUES + ".map(value => ({title: (dir_labels || {})[value] || value, value}))"),
                 "items": expr("Object.entries(dir_labels || {}).map(([value, title]) => ({title, value}))"),
                 "multiple": True, "chips": True, "closableChips": True, "returnObject": True,
                 "itemTitle": "title", "itemValue": "value", "onUpdate:modelValue": JS_SCAN_CHANGE,
-                "hint": "显示中文路径，保存与扫描使用目录 ID；可删除标签，也可输入网盘路径。旧 ID 浏览后会补上名称。",
+                "hint": "点击选择目录，可添加多个；也可输入网盘路径。只扫描这里列出的目录，修改后请保存。",
                 "persistent-hint": True,
-            }}, md=12, show=direct)),
-            row(col({"component": "VTextarea", "props": {
-                "model": "scan_dirs", "label": "扫描目录（每行一个）", "rows": 3,
-                "hint": expr(f"{local} ? '容器内影片目录的绝对路径；不接受 115 目录 ID' : '所选存储内的目录路径；与本地路径、115 直连 ID 不通用'"),
-                "persistent-hint": True,
-            }}, md=12, show=legacy)),
+            }}, md=9, show=direct),
+                col({"component": "VTextarea", "props": {
+                    "model": "scan_dirs", "label": "扫描目录（每行一个）", "rows": 2,
+                    "hint": expr(f"{local} ? '选择或填写容器内影片目录的绝对路径，修改后请保存' : '选择或填写所选存储内的目录路径，修改后请保存'"),
+                    "persistent-hint": True,
+                }}, md=9, show=legacy),
+                button("选择目录", JS_PICK_OPEN, icon="mdi-folder-open-outline", md=3, size="default")),
+            {"component": "VDialog", "props": {
+                "model": "dir_picker_open", "maxWidth": 800, "width": "calc(100% - 32px)",
+                "scrollable": True, "aria-label": "选择扫描目录", "onUpdate:modelValue": JS_PICK_TOGGLE,
+            }, "content": [{"component": "VCard", "props": {"style": "max-height: 85vh"}, "content": [
+                {"component": "VCardTitle", "text": "选择扫描目录"},
+                {"component": "VCardText", "content": [
+                    row(text("browse_path", "当前路径", "/", "输入路径后点击刷新", md=9, show=legacy,
+                             **{"onUpdate:modelValue": JS_BROWSE_CHANGE}),
+                        text("browse_display_path", "当前路径", "读取目录后显示名称", "输入路径后点击刷新", md=9, show=direct,
+                             **{"onUpdate:modelValue": JS_BROWSE_CHANGE,
+                                "modelValue": expr("String(browse_path || '/').startsWith('id:') ? (browse_display_path === browse_path ? browse_display_path : ((dir_labels || {})[browse_path] || (browse_path === 'id:0' ? '/' : ''))) : (browse_path || '/')")}),
+                        button("刷新", JS_LOAD, icon="mdi-refresh", md=3, loading=expr("dir_loading"), disabled=expr("dir_loading"))),
+                    {"component": "VProgressLinear", "props": {"show": expr("dir_loading"), "indeterminate": True, "color": "primary", "aria-label": "正在读取目录"}},
+                    # FormRender 总会传入 default slot，覆盖 VList 的 items 自动渲染；
+                    # 通过有界分页行绑定列表，避免空列表以及为大量目录生成无限表单节点。
+                    {"component": "VList", "props": {
+                        "selected": [], "selectStrategy": "single-leaf",
+                        "disabled": expr("dir_loading"), "onUpdate:selected": JS_PICK_NAV,
+                        "aria-label": "目录列表", "lines": "one",
+                    }, "content": [
+                        {"component": "VListItem", "props": {
+                            "title": "上一级", "value": "__parent__", "prependIcon": "mdi-arrow-up",
+                            "show": expr("browse_path && browse_path !== '/' && browse_path !== 'id:0'"),
+                        }},
+                        *[{"component": "VListItem", "props": {
+                            "title": expr(f"(dir_items[(dir_page - 1) * 50 + {i}] || {{}}).title || ''"),
+                            "value": expr(f"(dir_items[(dir_page - 1) * 50 + {i}] || {{}}).value || '__empty_{i}__'"),
+                            "show": expr(f"!!dir_items[(dir_page - 1) * 50 + {i}]"),
+                            "prependIcon": "mdi-folder-outline", "rounded": "lg", "class": "mb-1",
+                        }} for i in range(50)],
+                    ]},
+                    {"component": "VPagination", "props": {
+                        "model": "dir_page", "length": expr("Math.ceil(dir_items.length / 50)"),
+                        "show": expr("dir_items.length > 50"), "totalVisible": 5,
+                        "disabled": expr("dir_loading"), "aria-label": "目录翻页",
+                    }},
+                    text("dir_error", "目录状态", md=12, readonly=True, variant="plain", show="!!dir_error"),
+                ]},
+                {"component": "VCardActions", "content": [
+                    {"component": "VBtn", "props": {"onClick": JS_PICK_CLOSE}, "text": "取消"},
+                    {"component": "VSpacer"},
+                    {"component": "VBtn", "props": {"color": "primary", "variant": "tonal", "disabled": expr("dir_loading || !dir_ready"), "onClick": JS_PICK_CONFIRM}, "text": "选择当前目录"},
+                ]},
+            ]}]},
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2", "show": expr(f"!{local}")}, "content": [
                 {"component": "VCardText", "content": [
                     alert("输出到本地根目录/番号；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
@@ -1539,7 +1589,7 @@ class MetaTubeScraper(_PluginBase):
             "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
             "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
-            "browse_display_path": "/", "dir_labels": {},
+            "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
             "organize": False, "trigger_strm": True, "scan_mode": "subdir", "file_interval": 3,

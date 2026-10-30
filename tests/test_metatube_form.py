@@ -23,9 +23,10 @@ class FormTests(unittest.TestCase):
         cookie_check = values.pop('cookie_check', None)
         directory_flow = values.pop('directory_flow', None)
         directory_failure = values.pop('directory_failure', None)
+        picker_flow = values.pop('picker_flow', None)
         model.update(values)
         reply = subprocess.run([NODE, str(HERE / 'form_model.js')],
-                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check, directoryFlow=directory_flow, directoryFailure=directory_failure)),
+                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check, directoryFlow=directory_flow, directoryFailure=directory_failure, pickerFlow=picker_flow)),
                                capture_output=True, text=True, check=True)
         return json.loads(reply.stdout)
 
@@ -34,21 +35,19 @@ class FormTests(unittest.TestCase):
             result=self.render(version,directory_flow={'edit':True})
             self.assertEqual(result['intermediate']['display'],'/电影')
             self.assertEqual(result['intermediate']['ids'],'id:7')
-            self.assertIn('/电影',result['intermediate']['status'])
-            self.assertNotIn('id:7',result['intermediate']['status'])
             self.assertEqual(result['snapshots'][1]['scan_dirs']['modelValue'],[{'title':'/电影','value':'id:7'}])
             self.assertEqual(result['model']['browse_display_path'],'/新电影')
             self.assertEqual(result['model']['browse_path'],'/新电影')
             self.assertEqual(result['model']['scan_dirs'],'id:7\n/新电影')
             self.assertEqual(result['model']['dir_labels']['id:7'],'/电影')
             self.assertNotIn('browse_path',result['snapshots'][0])
-            self.assertIn('browse_display_path',result['snapshots'][0])
+            self.assertNotIn('browse_display_path',result['snapshots'][0])
 
     def test_old_id_lists_can_render_chinese_chips_and_legacy_paths_stay_editable(self):
         direct=self.render(scan_dirs=['id:7','/jav'],dir_labels={'id:7':'/电影'})['snapshots'][0]
         self.assertEqual(direct['scan_dirs']['modelValue'],[{'title':'/电影','value':'id:7'},{'title':'/jav','value':'/jav'}])
         legacy=self.render(storage='115Lite',scan_dirs='/电影')['snapshots'][0]
-        self.assertIn('browse_path',legacy)
+        self.assertNotIn('browse_path',legacy)
         self.assertNotIn('browse_display_path',legacy)
         self.assertNotIn('modelValue',legacy['scan_dirs'])
 
@@ -69,12 +68,12 @@ class FormTests(unittest.TestCase):
                 self.assertEqual(result['model']['browse_path'],'id:7')
                 self.assertEqual(result['model']['browse_display_path'],'/电影/中文合集')
                 self.assertEqual(result['model']['dir_parent'],'id:6')
-                self.assertEqual(result['model']['scan_dirs'],'id:7')
-                self.assertIn('/电影/中文合集',result['model']['dir_error'])
+                self.assertEqual(result['model']['scan_dirs'],'')
+                self.assertIn('读取',result['model']['dir_error'])
 
     def test_unresolved_old_id_does_not_display_root_or_allow_adding_a_false_label(self):
         for version in ('v2','v3'):
-            result=self.render(version,browse_path='id:7',browse_display_path='/',
+            result=self.render(version,browse_path='id:7',browse_display_path='/',dir_picker_open=True,
                                directory_failure={'action':'addOnly'})
             self.assertEqual(result['snapshots'][0]['browse_display_path'].get('modelValue'),'')
             self.assertEqual(result['model']['scan_dirs'],'')
@@ -82,10 +81,52 @@ class FormTests(unittest.TestCase):
 
     def test_manually_typed_directory_ids_remain_visible_and_plain_paths_have_correct_labels(self):
         for value in ('id:','id:99','id:7','id:78','/新电影'):
-            result=self.render(dir_labels={'id:7':'/电影'},changes=[{'field':'browse_display_path','value':value}])
+            result=self.render(dir_picker_open=True,dir_labels={'id:7':'/电影'},changes=[{'field':'browse_display_path','value':value}])
             self.assertEqual(result['snapshots'][-1]['browse_display_path']['modelValue'],value)
-        result=self.render(browse_path='/电影',browse_display_path='/',directory_failure={'action':'addOnly'})
-        self.assertEqual(result['model']['dir_error'],'已添加：/电影')
+
+    def test_picker_opens_and_reads_automatically_but_only_confirm_changes_scan_roots(self):
+        for version in ('v2','v3'):
+            result=self.render(version,scan_dirs='id:3',picker_flow={'confirm':True})
+            self.assertTrue(result['intermediate']['loading'])
+            self.assertEqual(result['intermediate']['unchanged'],'id:3')
+            self.assertNotIn('browse_display_path',result['snapshots'][0])
+            self.assertIn('browse_display_path',result['snapshots'][1])
+            self.assertEqual(result['model']['scan_dirs'],'id:3\nid:7')
+            self.assertFalse(result['model']['dir_picker_open'])
+            self.assertEqual(result['snapshots'][-1]['scan_dirs']['modelValue'],[{'title':'id:3','value':'id:3'},{'title':'/电影','value':'id:7'}])
+
+    def test_picker_cancel_and_late_results_preserve_existing_roots(self):
+        for case in ({'cancel':True},{'cancelPending':True},{'cancelPending':True,'dismiss':True}):
+            result=self.render(scan_dirs='/已有目录',picker_flow=case)
+            self.assertEqual(result['model']['scan_dirs'],'/已有目录')
+            self.assertFalse(result['model']['dir_picker_open'])
+            self.assertFalse(result['model']['dir_ready'])
+            self.assertEqual(result['model']['dir_items'],[])
+
+    def test_picker_can_select_the_same_empty_directory_without_duplicate_roots(self):
+        result=self.render(scan_dirs='id:7',picker_flow={'confirm':True})
+        self.assertEqual(result['model']['scan_dirs'],'id:7')
+        self.assertEqual(result['model']['dir_labels']['id:7'],'/电影')
+
+    def test_legacy_picker_adds_paths_and_keeps_the_browser_out_of_the_main_form(self):
+        for version in ('v2','v3'):
+            for storage in ('local','115Lite','u115',{'value':'alist'}):
+                result=self.render(version,storage=storage,browse_path='/电影',
+                                   scan_dirs='/已有目录',picker_flow={'confirm':True})
+                self.assertNotIn('browse_path',result['snapshots'][0])
+                self.assertIn('browse_path',result['snapshots'][1])
+                self.assertEqual(result['model']['scan_dirs'],'/已有目录\n/电影')
+                self.assertFalse(result['model']['dir_picker_open'])
+
+    def test_cookie_change_closes_picker_and_discards_pending_directory_results(self):
+        for action in ('load','enter','up'):
+            result=self.render(dir_picker_open=True,scan_dirs='id:3',
+                               async_browse={'action':action,'editCookie':True})
+            self.assertFalse(result['model']['dir_picker_open'])
+            self.assertFalse(result['model']['dir_ready'])
+            self.assertEqual(result['model']['dir_items'],[])
+            self.assertEqual(result['model']['scan_dirs'],'id:3')
+            self.assertEqual(result['model']['dir_labels'],{})
 
     def test_cookie_check_has_its_own_nearby_result_and_loading_state(self):
         for version in ('v2','v3'):
