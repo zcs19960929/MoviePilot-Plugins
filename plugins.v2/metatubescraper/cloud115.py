@@ -58,6 +58,7 @@ class Cloud115:
         self.interval = max(0, float(interval))
         self._lock = threading.RLock()
         self._last_request = 0.0
+        self._directory_paths = {"0": "/"}
         if sdk is None:
             if sys.version_info < (3, 12):
                 raise CloudError("115 直连模式需要 Python 3.12 或更高版本；原有模式仍可使用")
@@ -165,11 +166,34 @@ class Cloud115:
                     entries.append(entry)
                     seen.add(entry.id)
                     added += 1
+            # Reuse names already returned by fs_files; displaying a readable
+            # path must not add parent-walking requests for every browse.
+            names, paths = [], {}
+            for breadcrumb in breadcrumbs:
+                bid = str(breadcrumb.get("cid", breadcrumb.get("id", "")))
+                if bid == "0":
+                    continue
+                name = breadcrumb.get("name") or breadcrumb.get("n") or breadcrumb.get("fn")
+                if not bid or not name:
+                    break
+                names.append(str(name))
+                paths[bid] = "/" + "/".join(names)
+            with self._lock:
+                self._directory_paths.update(paths)
+                base = self._directory_paths.get(cid)
+                if base:
+                    for entry in entries:
+                        if entry.is_dir:
+                            self._directory_paths[entry.id] = base.rstrip("/") + "/" + entry.name
             offset += len(page)
             if offset >= count:
                 return entries
             if not page or not added:
                 raise CloudError("115 分页没有前进，已停止扫描")
+
+    def directory_path(self, cid):
+        with self._lock:
+            return self._directory_paths.get(str(cid))
 
     def info(self, fid):
         # Unlike fs_file_skim, get_info includes the parent ID required to

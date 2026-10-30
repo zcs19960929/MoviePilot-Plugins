@@ -105,6 +105,18 @@ NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DV", "
 }
 
 # ---- 表单目录浏览器的事件脚本（MoviePilot V3 FormRender 支持 on* 事件字符串）----
+JS_SCAN_VALUES = "(Array.isArray(scan_dirs) ? scan_dirs : String(scan_dirs || '').split(/[\\n,;]+/)).map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean)"
+
+JS_BROWSE_CHANGE = """(value) => {
+  browse_display_path = value || '/'; browse_path = browse_display_path;
+  dir_items = []; pick_dir = null; dir_loading = false; dir_error = '';
+}"""
+
+JS_SCAN_CHANGE = """(values) => {
+  const list = Array.isArray(values) ? values : (values ? [values] : []);
+  scan_dirs = [...new Set(list.map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean))].join('\\n');
+}"""
+
 JS_LOAD = """async () => {
   dir_items = [];
   const requestItems = dir_items;
@@ -120,7 +132,14 @@ JS_LOAD = """async () => {
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
-    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
+    if (st === '115_direct') {
+      const labels = { ...(dir_labels || {}) };
+      if (d.display_path) labels[d.path] = d.display_path;
+      for (const item of arr) if (item && item.type === 'dir' && item.display_path) labels[item.path] = item.display_path;
+      dir_labels = labels;
+      browse_path = d.path; dir_parent = d.parent;
+      browse_display_path = d.display_path || labels[d.path] || browse_display_path || '/';
+    }
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
@@ -131,7 +150,7 @@ JS_LOAD = """async () => {
 JS_ENTER = """async (v) => {
   const path = (v && v.value) ? v.value : v;
   if (!path) return;
-  browse_path = path; pick_dir = null;
+  pick_dir = null;
   dir_items = [];
   const requestItems = dir_items;
   const isCurrent = () => dir_items === requestItems;
@@ -145,7 +164,15 @@ JS_ENTER = """async (v) => {
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
-    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
+    if (st === '115_direct') {
+      const labels = { ...(dir_labels || {}) };
+      if (d.display_path) labels[d.path] = d.display_path;
+      for (const item of arr) if (item && item.type === 'dir' && item.display_path) labels[item.path] = item.display_path;
+      dir_labels = labels;
+      browse_path = d.path; dir_parent = d.parent;
+      browse_display_path = d.display_path || labels[d.path] || browse_display_path || '/';
+    }
+    if (st !== '115_direct') browse_path = path;
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
     if (!dir_items.length) { dir_error = '该目录下没有子目录'; }
   } catch (e) {
@@ -157,7 +184,7 @@ JS_UP = """async () => {
   const st = (storage && storage.value) ? storage.value : (storage || 'local');
   const p = String(browse_path || '/').replace(/\\/+$/, '');
   const i = p.lastIndexOf('/');
-  browse_path = st === '115_direct' ? (dir_parent || 'id:0') : (i <= 0 ? '/' : p.slice(0, i));
+  const target = st === '115_direct' ? (dir_parent || 'id:0') : (i <= 0 ? '/' : p.slice(0, i));
   pick_dir = null;
   dir_items = [];
   const requestItems = dir_items;
@@ -165,13 +192,21 @@ JS_UP = """async () => {
   dir_loading = true; dir_error = '';
   try {
     const r = st === '115_direct'
-      ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(browse_path))
-      : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: browse_path, type: 'dir' });
+      ? await window.MoviePilotAPI.get('/plugin/MetaTubeScraper/115/browse?path=' + encodeURIComponent(target))
+      : await window.MoviePilotAPI.post('/storage/list', { storage: st, path: target, type: 'dir' });
     if (!isCurrent()) return;
     const d = (r && r.data && !Array.isArray(r.data) && r.data.code !== undefined) ? r.data : r;
     if (d && d.code) throw new Error(d.msg || '读取失败');
     const arr = Array.isArray(d) ? d : ((d && d.data) || []);
-    if (st === '115_direct') { browse_path = d.path; dir_parent = d.parent; }
+    if (st === '115_direct') {
+      const labels = { ...(dir_labels || {}) };
+      if (d.display_path) labels[d.path] = d.display_path;
+      for (const item of arr) if (item && item.type === 'dir' && item.display_path) labels[item.path] = item.display_path;
+      dir_labels = labels;
+      browse_path = d.path; dir_parent = d.parent;
+      browse_display_path = d.display_path || labels[d.path] || browse_display_path || '/';
+    }
+    if (st !== '115_direct') browse_path = target;
     requestItems.push(...arr.filter(x => x && x.type === 'dir').map(x => ({ title: x.name, value: x.path })));
   } catch (e) {
     if (isCurrent()) dir_error = '读取失败：' + ((e && e.message) ? e.message : e);
@@ -212,6 +247,9 @@ JS_COOKIE_CHANGE = """(value) => {
   cookie115 = value || '';
   cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
   cookie115_msg = ''; cookie115_checking = false;
+  dir_labels = {}; dir_items = []; pick_dir = null;
+  browse_path = '/'; browse_display_path = '/'; dir_parent = 'id:0';
+  dir_loading = false; dir_error = 'Cookie 已修改，请先保存，再重新浏览确认扫描目录。';
 }"""
 
 JS_RUN = """async () => {
@@ -230,17 +268,23 @@ JS_RUN = """async () => {
 }"""
 
 JS_ADD = """() => {
+  if (dir_loading) { dir_error = '目录读取中，请稍候再添加'; return; }
   const p = (browse_path || '').trim();
   if (!p) { dir_error = '请先输入或选择路径'; return; }
-  const cur = String(scan_dirs || '').split(/[\\n,;]+/).map(s => s.trim()).filter(Boolean);
+  const st = (storage && storage.value) ? storage.value : storage;
+  if (st === '115_direct' && p.startsWith('id:') && p !== 'id:0' && !(dir_labels || {})[p]) {
+    dir_error = '请先读取目录，确认名称后再添加'; return;
+  }
+  const cur = (Array.isArray(scan_dirs) ? scan_dirs : String(scan_dirs || '').split(/[\\n,;]+/))
+    .map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean);
   if (cur.indexOf(p) === -1) { cur.push(p); }
   scan_dirs = cur.join('\\n');
-  dir_error = '已添加：' + p;
+  dir_error = '已添加：' + (st === '115_direct' ? ((dir_labels || {})[p] || (p === 'id:0' ? '/' : p)) : p);
 }"""
 
 JS_STORAGE_CHANGE = """(value) => {
   storage = (value && typeof value === 'object') ? (value.value || value.title || 'local') : (value || 'local');
-  browse_path = '/'; dir_parent = 'id:0'; dir_items = []; pick_dir = null;
+  browse_path = '/'; browse_display_path = '/'; dir_parent = 'id:0'; dir_items = []; pick_dir = null;
   dir_loading = false; run_msg = '';
   cookie115_check_id = (Number(cookie115_check_id) || 0) + 1;
   cookie115_msg = ''; cookie115_checking = false;
@@ -255,7 +299,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.3"
+    plugin_version = "1.1.4"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -1199,10 +1243,16 @@ class MetaTubeScraper(_PluginBase):
             client = self.__get_cloud115()
             cid = client.resolve_folder(path)
             current = client.info(cid) if cid != "0" else None
+            entries = client.listdir(cid)
+            display = getattr(client, "directory_path", lambda value: None)(cid)
+            if not display:
+                display = "/" if cid == "0" else (path if path.startswith("/") else "/" + current.name)
             return {"code": 0, "path": "id:" + cid,
+                    "display_path": display,
                     "parent": "id:" + (current.parent_id if current else "0"),
-                    "data": [{"name": e.name, "path": "id:" + e.id, "type": "dir"}
-                             for e in client.listdir(cid) if e.is_dir]}
+                    "data": [{"name": e.name, "path": "id:" + e.id, "type": "dir",
+                              "display_path": display.rstrip("/") + "/" + e.name}
+                             for e in entries if e.is_dir]}
         except CloudError as e:
             return {"code": 400, "msg": str(e), "data": []}
         except Exception:
@@ -1394,10 +1444,14 @@ class MetaTubeScraper(_PluginBase):
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2"}, "content": [
                 {"component": "VCardText", "content": [
                     row(text("browse_path", "当前浏览路径", "/",
-                             expr(f"{direct} ? '支持 /jav 或 id:目录ID；浏览后以稳定 ID 添加扫描目标' : ({local} ? '填写容器内绝对路径' : '填写所选存储内的路径，如 /jav')"), md=12)),
+                             expr(f"{local} ? '填写容器内绝对路径' : '填写所选存储内的路径，如 /jav'"), md=12, show=legacy),
+                        text("browse_display_path", "当前浏览路径", "读取目录后显示名称",
+                             "显示目录名称；后台按稳定 ID 定位。可输入路径后点击读取，旧 ID 浏览后会显示名称。", md=12, show=direct,
+                             **{"onUpdate:modelValue": JS_BROWSE_CHANGE,
+                                "modelValue": expr("String(browse_path || '/').startsWith('id:') ? (browse_display_path === browse_path ? browse_display_path : ((dir_labels || {})[browse_path] || (browse_path === 'id:0' ? '/' : ''))) : (browse_path || '/')")})),
                     row(button("读取目录", JS_LOAD, icon="mdi-folder-refresh"),
                         button("上一级", JS_UP, icon="mdi-arrow-up-bold"),
-                        button("添加为扫描目录", JS_ADD, icon="mdi-plus")),
+                        button("添加为扫描目录", JS_ADD, icon="mdi-plus", disabled=expr("dir_loading"))),
                     row(col({"component": "VSelect", "props": {
                             "model": "pick_dir", "label": "子目录（选择后自动进入）", "items": "{{ dir_items }}",
                             "itemTitle": "title", "itemValue": "value", "returnObject": False,
@@ -1406,11 +1460,20 @@ class MetaTubeScraper(_PluginBase):
                         text("dir_error", "浏览状态", md=4, readonly=True, variant="plain")),
                 ]},
             ]},
+            row(col({"component": "VCombobox", "props": {
+                "model": "scan_dirs", "label": "扫描目录（可多选）",
+                "modelValue": expr(JS_SCAN_VALUES + ".map(value => ({title: (dir_labels || {})[value] || value, value}))"),
+                "items": expr("Object.entries(dir_labels || {}).map(([value, title]) => ({title, value}))"),
+                "multiple": True, "chips": True, "closableChips": True, "returnObject": True,
+                "itemTitle": "title", "itemValue": "value", "onUpdate:modelValue": JS_SCAN_CHANGE,
+                "hint": "显示中文路径，保存与扫描使用目录 ID；可删除标签，也可输入网盘路径。旧 ID 浏览后会补上名称。",
+                "persistent-hint": True,
+            }}, md=12, show=direct)),
             row(col({"component": "VTextarea", "props": {
                 "model": "scan_dirs", "label": "扫描目录（每行一个）", "rows": 3,
-                "hint": expr(f"{direct} ? '115 目录 ID 或网盘路径，如 id:123 或 /jav；切换存储后请重新确认' : ({local} ? '容器内影片目录的绝对路径；不接受 115 目录 ID' : '所选存储内的目录路径；与本地路径、115 直连 ID 不通用')"),
+                "hint": expr(f"{local} ? '容器内影片目录的绝对路径；不接受 115 目录 ID' : '所选存储内的目录路径；与本地路径、115 直连 ID 不通用'"),
                 "persistent-hint": True,
-            }}, md=12)),
+            }}, md=12, show=legacy)),
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2", "show": expr(f"!{local}")}, "content": [
                 {"component": "VCardText", "content": [
                     alert("输出到本地根目录/番号；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
@@ -1476,6 +1539,7 @@ class MetaTubeScraper(_PluginBase):
             "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
             "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
+            "browse_display_path": "/", "dir_labels": {},
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
             "organize": False, "trigger_strm": True, "scan_mode": "subdir", "file_interval": 3,

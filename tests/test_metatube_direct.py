@@ -428,6 +428,21 @@ class DirectAcceptanceTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_directory_breadcrumbs_keep_unicode_names_without_extra_requests(self):
+        for version in ('v2','v3'):
+            m=components(version)
+            sdk=types.SimpleNamespace(fs_files=Mock(return_value={
+                'state':True,'count':1,
+                'path':[{'cid':'0','name':'根目录'},{'cid':'6','name':'电影'},{'cid':'7','name':'中文合集'}],
+                'data':[{'cid':'8','pid':'7','n':'演员 甲'}],
+            }))
+            client=m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture',sdk=sdk,interval=0)
+            client.listdir('7')
+            self.assertEqual(client.directory_path('0'),'/')
+            self.assertEqual(client.directory_path('7'),'/电影/中文合集')
+            self.assertEqual(client.directory_path('8'),'/电影/中文合集/演员 甲')
+            self.assertEqual(sdk.fs_files.call_count,1)
+
     def test_info_uses_full_entry_with_parent_and_directory_identity(self):
         m = components()
         sdk = types.SimpleNamespace(fs_file=Mock(side_effect=[

@@ -21,11 +21,71 @@ class FormTests(unittest.TestCase):
         changes = values.pop('changes', [])
         async_browse = values.pop('async_browse', None)
         cookie_check = values.pop('cookie_check', None)
+        directory_flow = values.pop('directory_flow', None)
+        directory_failure = values.pop('directory_failure', None)
         model.update(values)
         reply = subprocess.run([NODE, str(HERE / 'form_model.js')],
-                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check)),
+                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check, directoryFlow=directory_flow, directoryFailure=directory_failure)),
                                capture_output=True, text=True, check=True)
         return json.loads(reply.stdout)
+
+    def test_direct_directory_widgets_show_names_but_keep_ids_for_scanning(self):
+        for version in ('v2','v3'):
+            result=self.render(version,directory_flow={'edit':True})
+            self.assertEqual(result['intermediate']['display'],'/电影')
+            self.assertEqual(result['intermediate']['ids'],'id:7')
+            self.assertIn('/电影',result['intermediate']['status'])
+            self.assertNotIn('id:7',result['intermediate']['status'])
+            self.assertEqual(result['snapshots'][1]['scan_dirs']['modelValue'],[{'title':'/电影','value':'id:7'}])
+            self.assertEqual(result['model']['browse_display_path'],'/新电影')
+            self.assertEqual(result['model']['browse_path'],'/新电影')
+            self.assertEqual(result['model']['scan_dirs'],'id:7\n/新电影')
+            self.assertEqual(result['model']['dir_labels']['id:7'],'/电影')
+            self.assertNotIn('browse_path',result['snapshots'][0])
+            self.assertIn('browse_display_path',result['snapshots'][0])
+
+    def test_old_id_lists_can_render_chinese_chips_and_legacy_paths_stay_editable(self):
+        direct=self.render(scan_dirs=['id:7','/jav'],dir_labels={'id:7':'/电影'})['snapshots'][0]
+        self.assertEqual(direct['scan_dirs']['modelValue'],[{'title':'/电影','value':'id:7'},{'title':'/jav','value':'/jav'}])
+        legacy=self.render(storage='115Lite',scan_dirs='/电影')['snapshots'][0]
+        self.assertIn('browse_path',legacy)
+        self.assertNotIn('browse_display_path',legacy)
+        self.assertNotIn('modelValue',legacy['scan_dirs'])
+
+    def test_identical_directory_names_keep_distinct_ids_after_edit_and_reload(self):
+        labels={'id:7':'/电影','id:8':'/电影'}
+        values=[{'title':'/电影','value':'id:7'},{'title':'/电影','value':'id:8'}]
+        result=self.render(dir_labels=labels,changes=[{'field':'scan_dirs','value':values}])
+        self.assertEqual(result['model']['scan_dirs'],'id:7\nid:8')
+        reloaded=self.render(scan_dirs=result['model']['scan_dirs'],dir_labels=labels)
+        self.assertEqual(reloaded['snapshots'][0]['scan_dirs']['modelValue'],values)
+
+    def test_failed_navigation_never_adds_an_id_different_from_the_visible_directory(self):
+        for version in ('v2','v3'):
+            for action in ('up','enter'):
+                result=self.render(version,browse_path='id:7',browse_display_path='/电影/中文合集',
+                                   dir_parent='id:6',dir_labels={'id:7':'/电影/中文合集'},
+                                   directory_failure={'action':action})
+                self.assertEqual(result['model']['browse_path'],'id:7')
+                self.assertEqual(result['model']['browse_display_path'],'/电影/中文合集')
+                self.assertEqual(result['model']['dir_parent'],'id:6')
+                self.assertEqual(result['model']['scan_dirs'],'id:7')
+                self.assertIn('/电影/中文合集',result['model']['dir_error'])
+
+    def test_unresolved_old_id_does_not_display_root_or_allow_adding_a_false_label(self):
+        for version in ('v2','v3'):
+            result=self.render(version,browse_path='id:7',browse_display_path='/',
+                               directory_failure={'action':'addOnly'})
+            self.assertEqual(result['snapshots'][0]['browse_display_path'].get('modelValue'),'')
+            self.assertEqual(result['model']['scan_dirs'],'')
+            self.assertIn('读取',result['model']['dir_error'])
+
+    def test_manually_typed_directory_ids_remain_visible_and_plain_paths_have_correct_labels(self):
+        for value in ('id:','id:99','id:7','id:78','/新电影'):
+            result=self.render(dir_labels={'id:7':'/电影'},changes=[{'field':'browse_display_path','value':value}])
+            self.assertEqual(result['snapshots'][-1]['browse_display_path']['modelValue'],value)
+        result=self.render(browse_path='/电影',browse_display_path='/',directory_failure={'action':'addOnly'})
+        self.assertEqual(result['model']['dir_error'],'已添加：/电影')
 
     def test_cookie_check_has_its_own_nearby_result_and_loading_state(self):
         for version in ('v2','v3'):

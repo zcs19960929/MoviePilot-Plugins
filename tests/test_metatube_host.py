@@ -174,8 +174,27 @@ class HostTests(unittest.TestCase):
         routes = {api["path"]: api for api in plugin.get_api()}
         reply = routes["/115/browse"]["endpoint"](path="/")
         self.assertEqual(reply["data"][0]["path"], "id:7")
+        self.assertEqual(reply['display_path'],'/')
+        self.assertEqual(reply['data'][0]['display_path'],'/电影')
         self.assertEqual(reply["parent"], "id:0")
         self.assertEqual(routes["/115/check"]["endpoint"]()["code"], 0)
+
+    def test_browse_adds_readable_nested_paths_without_changing_stable_ids(self):
+        for version in ('v2','v3'):
+            plugin=load_plugin(version,Mock());plugin.init_plugin({'storage':'115_direct'})
+            plugin._cloud115=types.SimpleNamespace(
+                resolve_folder=lambda path:'7',
+                info=lambda cid:types.SimpleNamespace(name='中文合集',parent_id='6'),
+                listdir=lambda cid:[types.SimpleNamespace(name='演员 甲',id='8',is_dir=True)],
+                directory_path=lambda cid:'/电影/中文合集',
+            )
+            route=next(api for api in plugin.get_api() if api['path']=='/115/browse')
+            reply=route['endpoint'](path='id:7')
+            self.assertEqual(reply['path'],'id:7')
+            self.assertEqual(reply['parent'],'id:6')
+            self.assertEqual(reply['display_path'],'/电影/中文合集')
+            self.assertEqual(reply['data'][0]['path'],'id:8')
+            self.assertEqual(reply['data'][0]['display_path'],'/电影/中文合集/演员 甲')
 
     def test_direct_initialization_error_is_counted_and_saved(self):
         plugin = load_plugin("v3", Mock())

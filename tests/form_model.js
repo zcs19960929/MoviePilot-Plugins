@@ -1,6 +1,6 @@
 // Exercise the plugin schema using the host FormRender's expression/event contract.
 const fs = require('node:fs');
-const { form, model, changes = [], asyncBrowse, cookieCheck } = JSON.parse(fs.readFileSync(0, 'utf8'));
+const { form, model, changes = [], asyncBrowse, cookieCheck, directoryFlow, directoryFailure } = JSON.parse(fs.readFileSync(0, 'utf8'));
 const expression = value => typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}');
 const evaluate = value => expression(value)
   ? new Function('model', `with(model) { return ${value.slice(2, -2)} }`)(model)
@@ -42,6 +42,35 @@ for (const { field, value } of changes) {
   snapshots.push(visit(form));
 }
 let intermediate;
+if(directoryFailure) {
+  global.window={MoviePilotAPI:{get:async()=>{throw new Error('directory request failed');}}};
+  const source=directoryFailure.action==='up'
+    ? button(form,'上一级').props.onClick
+    : find(form,'pick_dir').props['onUpdate:modelValue'];
+  if(directoryFailure.action!=='addOnly') await execute(source,'id:8');
+  execute(button(form,'添加为扫描目录').props.onClick);
+  snapshots.push(visit(form));
+}
+if(directoryFlow) {
+  const replies=[
+    {code:0,path:'id:0',parent:'id:0',display_path:'/',data:[{name:'电影',path:'id:7',type:'dir',display_path:'/电影'}]},
+    {code:0,path:'id:7',parent:'id:0',display_path:'/电影',data:[{name:'中文合集',path:'id:8',type:'dir',display_path:'/电影/中文合集'}]},
+    {code:0,path:'id:0',parent:'id:0',display_path:'/',data:[{name:'电影',path:'id:7',type:'dir',display_path:'/电影'}]},
+  ];
+  global.window={MoviePilotAPI:{get:async()=>replies.shift()}};
+  await execute(button(form,'读取目录').props.onClick);
+  await execute(find(form,'pick_dir').props['onUpdate:modelValue'],'id:7');
+  execute(button(form,'添加为扫描目录').props.onClick);
+  snapshots.push(visit(form));
+  intermediate={display:model.browse_display_path,ids:model.scan_dirs,status:model.dir_error};
+  await execute(button(form,'上一级').props.onClick);
+  snapshots.push(visit(form));
+  if(directoryFlow.edit) {
+    execute(find(form,'browse_display_path').props['onUpdate:modelValue'],'/新电影');
+    execute(find(form,'scan_dirs').props['onUpdate:modelValue'],[{title:'/电影',value:'id:7'},'/新电影']);
+    snapshots.push(visit(form));
+  }
+}
 if (cookieCheck) {
   const pending=[];
   global.window={MoviePilotAPI:{get:()=>new Promise((resolve,reject)=>pending.push({resolve,reject}))}};
