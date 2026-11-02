@@ -214,7 +214,10 @@ jobs:
             git push origin "$BRANCH"
           fi
           printf 'Sync 115Lite %s from madrays/MoviePilot-Plugins commit %s.\n\nBoth installation orders passed on Linux x86_64 / Python 3.14. MetaTube pins remain unchanged.\n\nReview the changes, manually publish this branch using the publish action, verify the Release, then merge. This workflow does not merge or approve PRs.\n' "$VERSION" "$SOURCE_SHA" > candidate/body.md
-          gh pr create --base main --head "$BRANCH" --title "Sync 115Lite $VERSION" --body-file candidate/body.md
+          if ! gh pr create --base main --head "$BRANCH" --title "Sync 115Lite $VERSION" --body-file candidate/body.md; then
+            printf '::warning::PR creation was denied; the tested branch is preserved. Open https://github.com/%s/compare/main...%s?expand=1 to create it manually. This workflow does not change repository security settings.\n' "$GITHUB_REPOSITORY" "$BRANCH"
+            exit 1
+          fi
 
   publish:
     if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'

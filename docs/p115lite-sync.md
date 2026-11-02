@@ -37,6 +37,8 @@ python3.14 scripts/sync_p115lite.py --verify --build-dir .superpowers/artifacts
 
 手动同步需要仓库允许 GitHub Actions 创建 PR。工作流默认只读，只有创建 PR 的任务授予 `contents/pull-requests: write`，只有发布任务授予 `contents: write`；测试任务不持有写权限，检出的 Git 凭据不持久保存。由 `GITHUB_TOKEN` 创建的 PR 不会自动触发另一次 PR 工作流，因此同步流程自身先完成同样的两组测试，并保留测试产物。
 
+若仓库限制 Actions 创建 PR，工作流不会自动放宽安全设置：它会保留已测试分支，报告未创建 PR，并提供手动创建链接。需要全自动创建时，仓库管理员须自行确认 GitHub 的“允许 Actions 创建和批准 PR”设置；即使允许，当前工作流也没有批准或合并 PR 的步骤。
+
 已有相同版本 Release 时只核对内容一致，不替换资产或移动标签。若内容不同，发布失败，需要先厘清版本归属。
 
 ## 测试边界
