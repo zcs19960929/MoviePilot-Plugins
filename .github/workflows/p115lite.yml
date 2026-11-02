@@ -22,21 +22,15 @@ permissions:
   contents: read
 
 jobs:
-  compatibility:
+  prepare:
     runs-on: ubuntu-24.04
-    strategy:
-      fail-fast: false
-      matrix:
-        order: [metatube-first, lite-first]
     outputs:
-      changed: ${{ steps.sync.outputs.changed }}
+      changed: ${{ steps.sync.outputs.changed || 'false' }}
       base: ${{ steps.identity.outputs.base }}
-      version: ${{ steps.identity.outputs.version }}
-      upstream: ${{ steps.identity.outputs.upstream }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.repository_ref || github.ref }}
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.repository_ref || github.ref }}
           persist-credentials: false
       - uses: actions/setup-python@v5
         with:
@@ -58,20 +52,44 @@ jobs:
           with open(os.environ['GITHUB_OUTPUT'],'a') as f:
               print('changed='+str(d['changed']).lower(),file=f)
           PY
-      - name: Record tested identities
+      - name: Freeze one candidate before testing either installation order
         id: identity
         run: |
+          python scripts/sync_p115lite.py --verify
+          mkdir -p .superpowers/prepared
+          git add -N -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json
+          git diff --binary -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json > .superpowers/prepared/candidate.patch
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p115lite-source
+          path: .superpowers/prepared/
+
+  compatibility:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [metatube-first, lite-first]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-source
+          path: .superpowers/prepared
+      - name: Apply the same frozen candidate
+        run: |
           mkdir -p .superpowers/artifacts
-          python - <<'PY'
-          import json,os,subprocess
-          from pathlib import Path
-          d=json.loads(Path('upstream/p115lite.json').read_text())
-          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
-              print('base='+subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),file=f)
-              print('version='+d['version'],file=f)
-              print('upstream='+d['commit'],file=f)
-          Path('.superpowers/artifacts/provenance.json').write_text(json.dumps(d,ensure_ascii=False,indent=2))
-          PY
+          if [ -s .superpowers/prepared/candidate.patch ]; then
+            git apply .superpowers/prepared/candidate.patch
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - name: Install into one Python environment in either order
         env:
           INSTALL_ORDER: ${{ matrix.order }}
@@ -109,19 +127,56 @@ jobs:
           P115_TEST_TMPDIR: ${{ github.workspace }}/.superpowers/test-tmp
           PYTHONPATH: tests/support:plugins.v3/p115lite/tests/_stub_host:plugins.v3/p115lite:plugins.v3
         run: python -m unittest discover -s plugins.v3/p115lite/tests -p 'test_*.py' -v
-      - name: Verify and build the installable ZIP
+      - name: Build and record what this installation order actually tested
         run: |
-          python scripts/sync_p115lite.py --verify --build-dir .superpowers/artifacts
-          git add -N -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json
-          git diff --binary -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json > .superpowers/artifacts/candidate.patch
+          mkdir -p .superpowers/artifacts
+          python scripts/sync_p115lite.py --verify --build-dir .superpowers/artifacts > .superpowers/build.json
+          cp .superpowers/prepared/candidate.patch .superpowers/artifacts/
+          python - <<'CHECK'
+          import json,subprocess
+          from pathlib import Path
+          build=json.loads(Path('.superpowers/build.json').read_text())
+          source=json.loads(Path('upstream/p115lite.json').read_text())
+          report={key:build[key] for key in ('version','archive','sha256')}
+          report['base']=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          report['upstream']=source['commit']
+          Path('.superpowers/artifacts/compatibility.json').write_text(json.dumps(report))
+          Path('.superpowers/artifacts/provenance.json').write_text(json.dumps(source,ensure_ascii=False,indent=2))
+          CHECK
       - uses: actions/upload-artifact@v4
         with:
           name: p115lite-${{ matrix.order }}
           path: .superpowers/artifacts/
 
+  verify-artifacts:
+    needs: [prepare, compatibility]
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.verify.outputs.base }}
+      version: ${{ steps.verify.outputs.version }}
+      upstream: ${{ steps.verify.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-metatube-first
+          path: first
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-lite-first
+          path: second
+      - name: Reject differing sources, packages or release targets
+        id: verify
+        env:
+          EXPECTED_BASE: ${{ needs.prepare.outputs.base }}
+        run: python3 scripts/verify_p115lite_artifacts.py first second --expected-base "$EXPECTED_BASE"
+
   review-pr:
-    if: github.event_name == 'workflow_dispatch' && inputs.action == 'sync' && needs.compatibility.outputs.changed == 'true'
-    needs: compatibility
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'sync' && needs.prepare.outputs.changed == 'true'
+    needs: [prepare, verify-artifacts]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -129,7 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.compatibility.outputs.base }}
+          ref: ${{ needs.verify-artifacts.outputs.base }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -138,8 +193,8 @@ jobs:
       - name: Open a review PR without merging
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.compatibility.outputs.version }}
-          SOURCE_SHA: ${{ needs.compatibility.outputs.upstream }}
+          VERSION: ${{ needs.verify-artifacts.outputs.version }}
+          SOURCE_SHA: ${{ needs.verify-artifacts.outputs.upstream }}
         run: |
           BRANCH="codex/sync-p115lite-$VERSION-${SOURCE_SHA:0:8}"
           if gh pr list --head "$BRANCH" --json number --jq '.[0].number' | grep -q '[0-9]'; then
@@ -163,7 +218,7 @@ jobs:
 
   publish:
     if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
-    needs: compatibility
+    needs: [prepare, verify-artifacts]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -176,8 +231,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.compatibility.outputs.version }}
-          TESTED_SHA: ${{ needs.compatibility.outputs.base }}
+          VERSION: ${{ needs.verify-artifacts.outputs.version }}
+          TESTED_SHA: ${{ needs.verify-artifacts.outputs.base }}
         working-directory: candidate
         run: |
           sha256sum --check "p115lite_v$VERSION.zip.sha256"

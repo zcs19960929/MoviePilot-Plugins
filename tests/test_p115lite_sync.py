@@ -22,6 +22,16 @@ def importer():
     return module
 
 
+def artifact_checker():
+    path = ROOT / "scripts/verify_p115lite_artifacts.py"
+    if not path.exists():
+        raise AssertionError("cross-matrix artifact identity guard is not implemented")
+    spec = importlib.util.spec_from_file_location("p115lite_artifacts", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def fixture(module, version="3.0.3", sha="a" * 40):
     requirements = b"p115client==0.0.9.6.5.1\npython-concurrenttools==0.1.8\n"
     files = {
@@ -170,6 +180,60 @@ class SyncTests(unittest.TestCase):
         (self.root / "upstream/p115lite.json").write_text(json.dumps(record))
         with self.assertRaises(self.m.SyncError):
             self.m.build_archive(self.root)
+
+    def test_removed_upstream_file_cannot_delete_through_a_local_symlink(self):
+        old = "frontend/p115lite/retired/local.vue"
+        self.snapshot.files[old] = b"old source"
+        self.m.apply(self.root, self.m.prepare(self.root, self.snapshot))
+        target = self.root / old
+        target.unlink()
+        target.parent.rmdir()
+        with tempfile.TemporaryDirectory() as outside:
+            victim = Path(outside) / "local.vue"
+            victim.write_bytes(b"old source")
+            target.parent.symlink_to(Path(outside), target_is_directory=True)
+            try:
+                plan = self.m.prepare(self.root, fixture(self.m, "3.0.4", "b" * 40))
+                self.m.apply(self.root, plan)
+            except self.m.SyncError:
+                pass
+            self.assertTrue(victim.exists(), "sync followed a symlink while deleting a retired source")
+
+    def artifacts(self, base="a" * 40, upstream="b" * 40):
+        data = io.BytesIO()
+        with zipfile.ZipFile(data, "w") as archive:
+            archive.writestr("UPSTREAM.json", json.dumps({"commit":upstream,"version":"3.0.3"}))
+        info = {"base":base,"upstream":upstream,"version":"3.0.3", "archive":"p115lite_v3.0.3.zip", "sha256":self.m.digest(data.getvalue())}
+        directories = []
+        for name in ("first", "second"):
+            directory = self.root / name
+            directory.mkdir()
+            (directory / info["archive"]).write_bytes(data.getvalue())
+            (directory / "compatibility.json").write_text(json.dumps(info))
+            directories.append(directory)
+        return directories, info
+
+    def test_release_gate_accepts_only_identical_tested_snapshots(self):
+        checker = artifact_checker()
+        directories, info = self.artifacts()
+        self.assertEqual(checker.verify(*directories, "a" * 40), info)
+
+    def test_release_gate_rejects_matrix_ref_or_version_drift(self):
+        checker = artifact_checker()
+        directories, info = self.artifacts()
+        for key, value in (("base","c"*40),("upstream","c"*40),("version","3.0.4")):
+            (directories[1]/"compatibility.json").write_text(json.dumps(dict(info,**{key:value})))
+            with self.assertRaises(checker.ArtifactError):
+                checker.verify(*directories,"a"*40)
+
+    def test_release_gate_rejects_wrong_tag_target_or_tampered_zip(self):
+        checker = artifact_checker()
+        directories, info = self.artifacts()
+        with self.assertRaises(checker.ArtifactError):
+            checker.verify(*directories,"c"*40)
+        (directories[1]/info['archive']).write_bytes(b"different package")
+        with self.assertRaises(checker.ArtifactError):
+            checker.verify(*directories,"a"*40)
 
 
 if __name__ == "__main__":

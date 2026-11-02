@@ -114,10 +114,17 @@ def check_identity(files, entry, version):
         raise SyncError("Upstream marketplace must declare a V3 release")
 
 
+def checked_destination(root, name):
+    relative = Path(safe_path(name))
+    if any((root / parent).is_symlink() for parent in (relative, *relative.parents) if parent != Path(".")):
+        raise SyncError(f"Symlink in mirror destination: {name}")
+
+
 def checked_local(root, record):
     for name, expected in record["files"].items():
         if not safe_path(name).startswith((PLUGIN, FRONTEND)):
             raise SyncError("Provenance contains unowned path: " + name)
+        checked_destination(root, name)
         path = root / safe_path(name)
         if not path.is_file() or digest(path.read_bytes()) != expected:
             raise SyncError(f"Preserve local mirror edit or missing file: {name}")
@@ -190,9 +197,7 @@ def prepare(root: Path, snapshot: Snapshot) -> Plan:
     # Refuse collisions with untracked/user-managed source and symlinked parents.
     for name in files.keys() | {RECORD, "package.v3.json"}:
         target = root / name
-        relative = Path(name)
-        if any((root / parent).is_symlink() for parent in (relative, *relative.parents) if parent != Path(".")):
-            raise SyncError(f"Symlink in mirror destination: {name}")
+        checked_destination(root, name)
         if target.exists() and name not in (previous or {}).get("files", {}) and name not in {RECORD, "package.v3.json"}:
             raise SyncError(f"Preserve unmanaged local file: {name}")
     manifest["P115Lite"] = entry
@@ -204,6 +209,8 @@ def prepare(root: Path, snapshot: Snapshot) -> Plan:
 def apply(root: Path, plan: Plan):
     if not plan.changed:
         return
+    for name in list(plan.files) + plan.remove:
+        checked_destination(root, name)
     for name, data in plan.files.items():
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)

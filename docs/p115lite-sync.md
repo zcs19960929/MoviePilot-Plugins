@@ -31,7 +31,7 @@ python3.14 scripts/sync_p115lite.py --verify --build-dir .superpowers/artifacts
 
 1. 打开 Actions → **115Lite compatibility and manual sync** → Run workflow。
 2. `action=sync`、`repository_ref=main`，`upstream_ref` 填源分支、标签或提交。
-3. 工作流在 Linux x86_64 / Python 3.14 中分别按两种顺序安装依赖，运行 `pip check`、上游测试、MetaTube 回归和 SDK 共存检查。通过后创建待审核 PR；无变化不创建 PR。
+3. 工作流先冻结一次源提交和安装包，再在 Linux x86_64 / Python 3.14 中分别按两种顺序安装依赖，运行 `pip check`、上游测试、MetaTube 回归和 SDK 共存检查。两组产物的提交、版本及 ZIP SHA256 一致才创建待审核 PR；无变化不创建 PR。
 4. 审核差异及测试产物。准备发布时再运行同一工作流，选择 `action=publish`，`repository_ref` 填审核后的 PR 分支；该分支会重新通过全部检查后发布 Release。
 5. 确认本仓库 `P115Lite_v<版本>` Release 中的 ZIP 和 SHA256 文件可下载，再合并市场 PR。工作流不自动批准或合并 PR，也没有定时任务。
 
