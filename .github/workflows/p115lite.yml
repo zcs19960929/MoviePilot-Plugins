@@ -1,0 +1,251 @@
+name: 115Lite compatibility and manual sync
+
+on:
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: sync creates a review PR; publish releases a reviewed repository ref
+        type: choice
+        options: [sync, publish]
+        default: sync
+      upstream_ref:
+        description: Source branch, tag or commit to sync
+        default: main
+        type: string
+      repository_ref:
+        description: This repository ref to test (use reviewed PR branch for publish)
+        default: main
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      changed: ${{ steps.sync.outputs.changed || 'false' }}
+      base: ${{ steps.identity.outputs.base }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || inputs.repository_ref || github.ref }}
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Manually prepare a candidate
+        id: sync
+        if: github.event_name == 'workflow_dispatch' && inputs.action == 'sync'
+        env:
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          REPOSITORY_REF: ${{ inputs.repository_ref }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$REPOSITORY_REF" = main
+          mkdir -p .superpowers
+          python scripts/sync_p115lite.py --ref "$UPSTREAM_REF" --apply > .superpowers/sync.json
+          python - <<'PY'
+          import json,os
+          d=json.load(open('.superpowers/sync.json'))
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:
+              print('changed='+str(d['changed']).lower(),file=f)
+          PY
+      - name: Freeze one candidate before testing either installation order
+        id: identity
+        run: |
+          python scripts/sync_p115lite.py --verify
+          mkdir -p .superpowers/prepared
+          git add -N -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json
+          git diff --binary -- plugins.v3/p115lite frontend/p115lite upstream/p115lite.json package.v3.json > .superpowers/prepared/candidate.patch
+          echo "base=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p115lite-source
+          path: .superpowers/prepared/
+
+  compatibility:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        order: [metatube-first, lite-first]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-source
+          path: .superpowers/prepared
+      - name: Apply the same frozen candidate
+        run: |
+          mkdir -p .superpowers/artifacts
+          if [ -s .superpowers/prepared/candidate.patch ]; then
+            git apply .superpowers/prepared/candidate.patch
+          fi
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Install into one Python environment in either order
+        env:
+          INSTALL_ORDER: ${{ matrix.order }}
+        run: |
+          python -c "import sys,platform; assert sys.version_info[:2]==(3,14) and platform.machine()=='x86_64' and platform.system()=='Linux'"
+          python -m pip install --upgrade pip
+          if [ "$INSTALL_ORDER" = metatube-first ]; then
+            python -m pip install -r plugins.v3/metatubescraper/requirements.txt
+            python -m pip install --find-links plugins.v3/p115lite/wheels -r plugins.v3/p115lite/requirements.txt
+          else
+            python -m pip install --find-links plugins.v3/p115lite/wheels -r plugins.v3/p115lite/requirements.txt
+            python -m pip install -r plugins.v3/metatubescraper/requirements.txt
+          fi
+          python -m pip install requests fastapi httpx httpcore-request
+          python -m pip check
+          python -m pip freeze > .superpowers/artifacts/dependencies.txt
+          python - <<'PY'
+          from importlib.metadata import version
+          assert version('p115client')=='0.0.9.6.5.1'
+          assert version('python-concurrenttools')=='0.1.8'
+          import full_strm_sync,txt_tree_storage,share_strm_scan
+          PY
+      - name: MetaTube, sync safety and shared SDK lifecycle
+        run: |
+          python - <<'PY'
+          import unittest
+          result=unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.discover('tests'))
+          assert result.wasSuccessful()
+          assert not result.skipped, result.skipped
+          PY
+      - name: Upstream 115Lite tests with isolated host and cache
+        env:
+          P115_TEST_HOST: '1'
+          P115_TEST_SDK_CACHE: ${{ github.workspace }}/.superpowers/sdk-cache
+          P115_TEST_TMPDIR: ${{ github.workspace }}/.superpowers/test-tmp
+          PYTHONPATH: tests/support:plugins.v3/p115lite/tests/_stub_host:plugins.v3/p115lite:plugins.v3
+        run: python -m unittest discover -s plugins.v3/p115lite/tests -p 'test_*.py' -v
+      - name: Build and record what this installation order actually tested
+        run: |
+          mkdir -p .superpowers/artifacts
+          python scripts/sync_p115lite.py --verify --build-dir .superpowers/artifacts > .superpowers/build.json
+          cp .superpowers/prepared/candidate.patch .superpowers/artifacts/
+          python - <<'CHECK'
+          import json,subprocess
+          from pathlib import Path
+          build=json.loads(Path('.superpowers/build.json').read_text())
+          source=json.loads(Path('upstream/p115lite.json').read_text())
+          report={key:build[key] for key in ('version','archive','sha256')}
+          report['base']=subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip()
+          report['upstream']=source['commit']
+          Path('.superpowers/artifacts/compatibility.json').write_text(json.dumps(report))
+          Path('.superpowers/artifacts/provenance.json').write_text(json.dumps(source,ensure_ascii=False,indent=2))
+          CHECK
+      - uses: actions/upload-artifact@v4
+        with:
+          name: p115lite-${{ matrix.order }}
+          path: .superpowers/artifacts/
+
+  verify-artifacts:
+    needs: [prepare, compatibility]
+    runs-on: ubuntu-24.04
+    outputs:
+      base: ${{ steps.verify.outputs.base }}
+      version: ${{ steps.verify.outputs.version }}
+      upstream: ${{ steps.verify.outputs.upstream }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-metatube-first
+          path: first
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-lite-first
+          path: second
+      - name: Reject differing sources, packages or release targets
+        id: verify
+        env:
+          EXPECTED_BASE: ${{ needs.prepare.outputs.base }}
+        run: python3 scripts/verify_p115lite_artifacts.py first second --expected-base "$EXPECTED_BASE"
+
+  review-pr:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'sync' && needs.prepare.outputs.changed == 'true'
+    needs: [prepare, verify-artifacts]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify-artifacts.outputs.base }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-metatube-first
+          path: candidate
+      - name: Open a review PR without merging
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.verify-artifacts.outputs.version }}
+          SOURCE_SHA: ${{ needs.verify-artifacts.outputs.upstream }}
+        run: |
+          BRANCH="codex/sync-p115lite-$VERSION-${SOURCE_SHA:0:8}"
+          if gh pr list --head "$BRANCH" --json number --jq '.[0].number' | grep -q '[0-9]'; then
+            echo 'A review PR already exists.'
+            exit 0
+          fi
+          git switch -c "$BRANCH"
+          git apply --index candidate/candidate.patch
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -m "chore(p115lite): sync $VERSION from ${SOURCE_SHA:0:8}"
+          gh auth setup-git
+          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
+            git fetch origin "$BRANCH"
+            git diff --exit-code FETCH_HEAD HEAD
+          else
+            git push origin "$BRANCH"
+          fi
+          printf 'Sync 115Lite %s from madrays/MoviePilot-Plugins commit %s.\n\nBoth installation orders passed on Linux x86_64 / Python 3.14. MetaTube pins remain unchanged.\n\nReview the changes, manually publish this branch using the publish action, verify the Release, then merge. This workflow does not merge or approve PRs.\n' "$VERSION" "$SOURCE_SHA" > candidate/body.md
+          if ! gh pr create --base main --head "$BRANCH" --title "Sync 115Lite $VERSION" --body-file candidate/body.md; then
+            printf '::warning::PR creation was denied; the tested branch is preserved. Open https://github.com/%s/compare/main...%s?expand=1 to create it manually. This workflow does not change repository security settings.\n' "$GITHUB_REPOSITORY" "$BRANCH"
+            exit 1
+          fi
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.action == 'publish'
+    needs: [prepare, verify-artifacts]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: p115lite-metatube-first
+          path: candidate
+      - name: Publish the verified package without replacing existing versions
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.verify-artifacts.outputs.version }}
+          TESTED_SHA: ${{ needs.verify-artifacts.outputs.base }}
+        working-directory: candidate
+        run: |
+          sha256sum --check "p115lite_v$VERSION.zip.sha256"
+          TAG="P115Lite_v$VERSION"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            mkdir existing
+            gh release download "$TAG" --pattern "p115lite_v$VERSION.zip" --dir existing
+            cmp "p115lite_v$VERSION.zip" "existing/p115lite_v$VERSION.zip"
+            echo 'Identical release already exists; nothing replaced.'
+            exit 0
+          fi
+          printf '115Lite %s mirror of madrays/MoviePilot-Plugins. See provenance.json for the fixed source and original authors.\n\nLinux/glibc x86_64 / CPython 3.14 only. Both plugin installation orders, upstream tests, MetaTube regressions and SDK lifecycle checks passed. Install using this repository after the reviewed marketplace PR is merged.\n' "$VERSION" > notes.md
+          gh release create "$TAG" "p115lite_v$VERSION.zip" "p115lite_v$VERSION.zip.sha256" provenance.json dependencies.txt --target "$TESTED_SHA" --title "115Lite $VERSION (upstream mirror)" --notes-file notes.md
