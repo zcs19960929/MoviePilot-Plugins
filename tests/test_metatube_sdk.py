@@ -76,7 +76,9 @@ class PlaybackHTTPTests(unittest.TestCase):
             media_id = (Path(directory) / "library/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
             plugin = load_plugin("v3", Mock())
             plugin.init_plugin({"storage": "115_direct", "enabled": False})
-            plugin._direct_service = service
+            playback = plugin._MetaTubeScraper__get_playback_service.__globals__["PlaybackService"](cloud, Path(directory)/"state")
+            self.addCleanup(playback.close)
+            plugin._playback_service = playback
             route = next(api for api in plugin.get_api() if api["path"] == "/redirect_url")
             app = FastAPI()
             app.add_api_route("/redirect_url", route["endpoint"], methods=route["methods"])

@@ -25,11 +25,20 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+class UnknownMedia(KeyError):
+    """The capability is absent from this account registry."""
+
+
 class Registry:
-    def __init__(self, directory, output_root=None):
+    def __init__(self, directory, output_root=None, readonly=False, create=True, expected_identity=None):
         self.directory = Path(directory)
         self.output_root = output_root
-        self.directory.mkdir(parents=True, exist_ok=True)
+        self.readonly = readonly
+        self.create = create and not readonly
+        self.expected_identity = expected_identity
+        self.identity = None
+        if self.create:
+            self.directory.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         self.db = None
         self.reopen()
@@ -38,8 +47,34 @@ class Registry:
         with self._lock:
             if self.db is not None:
                 return
-            self.db = sqlite3.connect(str(self.directory / "direct.sqlite3"), check_same_thread=False)
-            self.db.row_factory = sqlite3.Row
+            path = self.directory / "direct.sqlite3"
+            try:
+                before = path.stat()
+                identity = (before.st_dev, before.st_ino)
+            except FileNotFoundError:
+                identity = None
+            if not self.create and identity is None:
+                raise CloudError("播放登记数据库缺失，请检查插件数据目录或恢复备份")
+            if self.expected_identity is not None and identity != self.expected_identity:
+                raise CloudError("播放登记数据库在检查后被替换，请重新检查")
+            try:
+                if self.create:
+                    self.db = sqlite3.connect(str(path), check_same_thread=False)
+                else:
+                    mode = "ro" if self.readonly else "rw"
+                    self.db = sqlite3.connect(path.resolve().as_uri() + "?mode=" + mode, uri=True, check_same_thread=False)
+                self.db.row_factory = sqlite3.Row
+                current = path.stat()
+                self.identity = (current.st_dev, current.st_ino)
+                if identity is not None and self.identity != identity:
+                    raise CloudError("播放登记数据库在打开时被替换，请重新检查")
+                if self.readonly:
+                    self.db.execute("PRAGMA query_only=ON")
+                    self.db.execute("SELECT token,account,fid,entry FROM media LIMIT 0")
+                    return
+            except (sqlite3.Error, OSError, CloudError):
+                self.close()
+                raise CloudError("播放登记数据库不可用或已被替换，请检查插件数据目录或备份") from None
             self.db.executescript("""
                 CREATE TABLE IF NOT EXISTS jobs (
                     account TEXT, job TEXT, plan TEXT, complete INTEGER DEFAULT 0,
@@ -47,11 +82,23 @@ class Registry:
                 CREATE TABLE IF NOT EXISTS media (
                     token TEXT PRIMARY KEY, account TEXT, fid TEXT, entry TEXT,
                     UNIQUE(account, fid));
+                CREATE TABLE IF NOT EXISTS media_aliases (
+                    token TEXT PRIMARY KEY, account TEXT NOT NULL, fid TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS outputs (
                     path TEXT PRIMARY KEY, account TEXT, job TEXT,
                     digest TEXT, pending TEXT);
             """)
             self.db.commit()
+
+    def check_identity(self):
+        # A live SQLite connection can still read a deleted/replaced inode.
+        # Never serve an old capability after the configured file disappeared.
+        try:
+            current = (self.directory / "direct.sqlite3").stat()
+        except OSError:
+            raise CloudError("播放登记数据库缺失，请检查插件数据目录或恢复备份") from None
+        if (current.st_dev, current.st_ino) != self.identity:
+            raise CloudError("播放登记数据库已被替换，请重新加载插件后重试")
 
     def close(self):
         with self._lock:
@@ -69,19 +116,71 @@ class Registry:
             self.db.execute("INSERT OR REPLACE INTO jobs VALUES(?,?,?,?)",
                             (account, job, json.dumps(plan, ensure_ascii=False), int(complete)))
 
+    def _media_token(self, account, entry):
+        # Acquire the SQLite write lock before reading. Independent Registry
+        # connections/processes must never replace another returned capability.
+        token = secrets.token_hex(32)
+        if self.db.execute("SELECT 1 FROM media_aliases WHERE token=?", (token,)).fetchone():
+            raise CloudError("播放标识冲突，请重试")
+        self.db.execute("""INSERT INTO media(token,account,fid,entry) VALUES(?,?,?,?)
+                        ON CONFLICT(account,fid) DO UPDATE SET entry=excluded.entry""",
+                        (token, account, entry.id, json.dumps(asdict(entry))))
+        return self.db.execute("SELECT token FROM media WHERE account=? AND fid=?",
+                               (account, entry.id)).fetchone()["token"]
+
     def media_token(self, account, entry):
         with self._lock, self.db:
-            row = self.db.execute("SELECT token FROM media WHERE account=? AND fid=?", (account, entry.id)).fetchone()
-            token = row["token"] if row else secrets.token_hex(32)
-            self.db.execute("INSERT OR REPLACE INTO media VALUES(?,?,?,?)",
-                            (token, account, entry.id, json.dumps(asdict(entry))))
-            return token
+            self.check_identity()
+            self.db.execute("BEGIN IMMEDIATE")
+            return self._media_token(account, entry)
+
+    def restore_media(self, account, entry, token, expected=None):
+        """Add an explicitly verified legacy capability without rebinding IDs.
+
+        expected is an optional snapshot of affected rows from a repair preview;
+        it is checked after taking the SQLite write lock.
+        """
+        if not re.fullmatch(r"[a-f0-9]{64}", token) or entry.is_dir or not entry.pickcode:
+            raise CloudError("恢复播放登记的标识或视频信息无效")
+        with self._lock, self.db:
+            self.check_identity()
+            self.db.execute("BEGIN IMMEDIATE")
+            self.check_identity()
+            if expected is not None and self.snapshot(account, entry.id, token) != expected:
+                raise CloudError("播放登记已在检查后变化，请重新检查")
+            for table in ("media", "media_aliases"):
+                row = self.db.execute("SELECT account,fid FROM " + table + " WHERE token=?", (token,)).fetchone()
+                if row and (row["account"], row["fid"]) != (account, entry.id):
+                    raise CloudError("旧播放标识已属于其他账户或文件，已跳过")
+                if row:
+                    return False
+            self._media_token(account, entry)
+            self.db.execute("INSERT INTO media_aliases(token,account,fid) VALUES(?,?,?)", (token, account, entry.id))
+            return True
+
+    def snapshot(self, account, fid, token):
+        """Only the affected records, used to reject stale repair previews."""
+        with self._lock:
+            self.check_identity()
+            rows = [tuple(r) for r in self.db.execute(
+                "SELECT token,account,fid,entry FROM media WHERE token=? OR (account=? AND fid=?) ORDER BY token",
+                (token, account, fid))]
+            aliases = []
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_aliases'").fetchone():
+                aliases = [tuple(r) for r in self.db.execute(
+                    "SELECT token,account,fid FROM media_aliases WHERE token=?", (token,))]
+            return (rows, aliases)
 
     def media(self, account, token):
         with self._lock:
+            self.check_identity()
             row = self.db.execute("SELECT entry FROM media WHERE token=? AND account=?", (token, account)).fetchone()
+            if row is None and self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_aliases'").fetchone():
+                row = self.db.execute("""SELECT m.entry FROM media_aliases a JOIN media m
+                        ON m.account=a.account AND m.fid=a.fid WHERE a.token=? AND a.account=?""",
+                        (token, account)).fetchone()
             if row is None:
-                raise KeyError("未登记的播放标识")
+                raise UnknownMedia("未登记的播放标识")
             return Entry(**json.loads(row["entry"]))
 
     def _output(self, path):
@@ -125,15 +224,55 @@ class Registry:
             self.db.execute("UPDATE outputs SET digest=?,pending=NULL WHERE path=?", (digest(data), str(path)))
 
 
+class PlaybackService:
+    """Playback opens existing state only; no library or empty database creation."""
+    def __init__(self, client, data_dir):
+        self.client = client
+        self.registry = Registry(data_dir, readonly=True)
+        self._cache = {}
+        self._play_lock = threading.RLock()
+
+    def close(self):
+        self.registry.close()
+
+    def playback_url(self, media_id, user_agent=""):
+        entry = self.registry.media(self.client.account, media_id)
+        key = (self.client.account, entry.id, user_agent)
+        with self._play_lock:
+            cached = self._cache.get(key)
+            if cached and cached[1] > time.time():
+                return cached[0]
+            link = self.client.download_link(entry, user_agent)
+            query = parse_qs(urlsplit(link.url).query)
+            if any(k.lower() == "cookie" and v for k, v in link.headers.items()) or query.get("f") == ["3"]:
+                raise CloudError("此 115 链接需要额外 Cookie，不能通过 302 直接播放")
+            if urlsplit(link.url).scheme not in ("http", "https") or not urlsplit(link.url).hostname:
+                raise CloudError("115 返回了无效的播放链接")
+            if link.expires <= time.time() + 5:
+                raise CloudError("115 播放链接已过期，请稍后重试")
+            self._cache[key] = (link.url, min(link.expires - 5, time.time() + 60))
+            # A library can be large; bound process-local URL cache growth.
+            if len(self._cache) > 512:
+                self._cache = {k: v for k, v in self._cache.items() if v[1] > time.time()}
+                if len(self._cache) > 512:
+                    self._cache.pop(next(iter(self._cache)))
+            return link.url
+
+
 def _part(name):
     match = re.search(r"(?:[-_.\s])(?:CD|DISC|PART)[-_.\s]?(\d+)(?=[-_.\s]|$)", Path(name).stem, re.I)
     return "-CD" + str(int(match[1])) if match else ""
 
 
-class DirectService:
+class DirectService(PlaybackService):
     def __init__(self, client, data_dir, output_root, playback_base_url, metadata,
-                 artwork, build_nfo, extract_number, stop_event=None, force=False):
+                 artwork, build_nfo, extract_number, stop_event=None, force=False, plugin_id="MetaTubeScraper"):
         self.client = client
+        if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", plugin_id):
+            raise CloudError("插件实例标识无效")
+        self.plugin_id = plugin_id
+        if not Path(output_root).is_absolute():
+            raise CloudError("本地媒体库根目录必须使用绝对路径，例如 /media/link/japan")
         self.root = Path(output_root).resolve()
         self.base = playback_base_url.rstrip("/")
         parts = urlsplit(self.base)
@@ -307,7 +446,7 @@ class DirectService:
                 if item["kind"] == "video":
                     token = self.registry.media_token(account, entry)
                     name = Path(item["target"]).stem + ".strm"
-                    data[name] = (self.base + "/api/v1/plugin/MetaTubeScraper/redirect_url?media_id=" + token + "\n").encode()
+                    data[name] = (self.base + "/api/v1/plugin/" + self.plugin_id + "/redirect_url?media_id=" + token + "\n").encode()
                 else:
                     name = item["target"]
                     existing = self.registry.owned_bytes(folder / name, account, job)
@@ -423,26 +562,3 @@ class DirectService:
                     stats["errors"].append(number + "：" + message)
                 stats[status] += 1
         return stats
-
-    def playback_url(self, media_id, user_agent=""):
-        entry = self.registry.media(self.client.account, media_id)
-        key = (self.client.account, entry.id, user_agent)
-        with self._play_lock:
-            cached = self._cache.get(key)
-            if cached and cached[1] > time.time():
-                return cached[0]
-            link = self.client.download_link(entry, user_agent)
-            query = parse_qs(urlsplit(link.url).query)
-            if any(k.lower() == "cookie" and v for k, v in link.headers.items()) or query.get("f") == ["3"]:
-                raise CloudError("此 115 链接需要额外 Cookie，不能通过 302 直接播放")
-            if urlsplit(link.url).scheme not in ("http", "https") or not urlsplit(link.url).hostname:
-                raise CloudError("115 返回了无效的播放链接")
-            if link.expires <= time.time() + 5:
-                raise CloudError("115 播放链接已过期，请稍后重试")
-            self._cache[key] = (link.url, min(link.expires - 5, time.time() + 60))
-            # A library can be large; bound process-local URL cache growth.
-            if len(self._cache) > 512:
-                self._cache = {k: v for k, v in self._cache.items() if v[1] > time.time()}
-                if len(self._cache) > 512:
-                    self._cache.pop(next(iter(self._cache)))
-            return link.url

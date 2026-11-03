@@ -23,7 +23,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .direct import DirectService
+from .direct import DirectService, PlaybackService, UnknownMedia
 from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError, Stopped
 from .schedule import build_schedule
 
@@ -323,7 +323,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.5"
+    plugin_version = "1.1.6"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -407,6 +407,10 @@ class MetaTubeScraper(_PluginBase):
                 if not hasattr(self, "_retired_services"):
                     self._retired_services = []
                 self._retired_services.append(previous)
+        playback = getattr(self, "_playback_service", None)
+        if playback is not None:
+            playback.close()
+        self._playback_service = None
         self._cloud115 = None
         self._direct_service = None
         self._stop_event = threading.Event()
@@ -486,6 +490,8 @@ class MetaTubeScraper(_PluginBase):
                 errors.append("请填写 115 Cookie")
             if not self._local_strm_root:
                 errors.append("请填写本地媒体库根目录")
+            elif not Path(self._local_strm_root).is_absolute():
+                errors.append("本地媒体库根目录必须使用绝对路径，例如 /media/link/japan")
             if not self._playback_base_url:
                 errors.append("请填写 MoviePilot 播放入口地址")
         elif not self._is_local:
@@ -493,6 +499,8 @@ class MetaTubeScraper(_PluginBase):
                 errors.append("请至少启用一种有效输出；115Lite 模式需要开启本地元数据输出")
             if self._write_local and not self._local_strm_root:
                 errors.append("本地元数据输出需要填写本地媒体库根目录")
+            if self._write_local and self._local_strm_root and not Path(self._local_strm_root).is_absolute():
+                errors.append("本地媒体库根目录必须使用绝对路径，例如 /media/link/japan")
             if (self._write_local or self._organize) and not self._remote_lib_root:
                 errors.append("目录映射或自动归位需要填写网盘媒体库根目录")
         return errors
@@ -544,9 +552,22 @@ class MetaTubeScraper(_PluginBase):
                     output_root=self._local_strm_root, playback_base_url=self._playback_base_url,
                     metadata=metadata, artwork=artwork, build_nfo=backend.__build_nfo,
                     extract_number=lambda text: backend.__extract_number(text, backend._numeric_ids),
-                    stop_event=self._stop_event, force=self._force,
+                    stop_event=self._stop_event, force=self._force, plugin_id=self.__class__.__name__,
                 )
             return self._direct_service
+
+    def __get_playback_service(self):
+        with self._direct_lock:
+            if self._direct_service is not None:
+                return self._direct_service
+            if getattr(self, "_playback_service", None) is None:
+                if not hasattr(self, "get_data_path"):
+                    raise CloudError("宿主无法提供插件数据目录")
+                directory = Path(self.get_data_path()) / "115_direct"
+                if not (directory / "direct.sqlite3").is_file():
+                    raise CloudError("播放登记数据库缺失，请检查插件数据目录或恢复备份")
+                self._playback_service = PlaybackService(self.__get_cloud115(), directory)
+            return self._playback_service
 
     # ---------------- 番号识别 ----------------
 
@@ -1285,16 +1306,16 @@ class MetaTubeScraper(_PluginBase):
     def __api_redirect(self, request: Request, media_id: str = ""):
         from starlette.responses import JSONResponse, RedirectResponse
         if not re.fullmatch(r"[a-f0-9]{64}", media_id):
-            return JSONResponse({"error": "未登记的播放标识"}, status_code=404)
+            return JSONResponse({"error": "未登记的播放标识"}, status_code=404, headers={"Cache-Control": "no-store"})
         try:
-            url = self.__get_direct_service().playback_url(media_id, request.headers.get("User-Agent", ""))
+            url = self.__get_playback_service().playback_url(media_id, request.headers.get("User-Agent", ""))
             return RedirectResponse(url, status_code=302, headers={"Cache-Control": "no-store"})
-        except KeyError:
-            return JSONResponse({"error": "未登记的播放标识"}, status_code=404)
+        except UnknownMedia:
+            return JSONResponse({"error": "未登记的播放标识"}, status_code=404, headers={"Cache-Control": "no-store"})
         except CloudError as e:
-            return JSONResponse({"error": str(e)}, status_code=503)
+            return JSONResponse({"error": str(e)}, status_code=503, headers={"Cache-Control": "no-store"})
         except Exception:
-            return JSONResponse({"error": "115 播放服务不可用"}, status_code=503)
+            return JSONResponse({"error": "115 播放服务不可用"}, status_code=503, headers={"Cache-Control": "no-store"})
 
     def __api_selftest(self, q: str = "SSIS-110") -> Dict[str, Any]:
         """逐源探测：区分 provider 不存在 / 搜不到 / 有结果"""
