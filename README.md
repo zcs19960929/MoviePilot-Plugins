@@ -6,7 +6,7 @@
 
 | 插件 | 版本 | 说明 |
 |---|---|---|
-| [MetaTube 番号刮削](#metatube-番号刮削) | v1.1.8 | 独立访问 115，弹窗选择扫描目录与本地媒体库；简易/Cron 调度，番号标题及资料展示 |
+| [MetaTube 番号刮削](#metatube-番号刮削) | v1.1.9 | 独立访问 115，弹窗选择扫描目录与本地媒体库；简易/Cron 调度，番号标题及资料展示 |
 | [115Lite（上游镜像）](docs/p115lite-sync.md) | v3.0.3 | 同步 madrays 版本，V3 / Python 3.14 / Linux x86_64；含完整前端和 Rust wheel 安装包 |
 
 版本变更与升级步骤见 [更新记录](CHANGELOG.md)。

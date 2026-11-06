@@ -238,6 +238,13 @@ class DirectAcceptanceTests(unittest.TestCase):
             ("IPX-939.mp4", False, "IPX-939"),
             ("www.98T.la@IPX-939.mp4", False, "IPX-939"),
             (r"www\.98T.la@ipx939.mkv", False, "IPX-939"),
+            ("www.98T.la@www.98T.la@ADN-206_restored_wm.mp4", False, "ADN-206"),
+            ("example.org@www.98t.la@HAWA-350_ltx_wm.mp4", False, "HAWA-350"),
+            ("www.98T.laipx-724_LXT.mp4", False, "IPX-724"),
+            (r"www\.98T.la@www\.98T.laMIAB-043_restored.mp4", False, "MIAB-043"),
+            ("www.98T.la[LTX]MIAD-681_restored（新水印）.mp4", False, "MIAD-681"),
+            ("www.98T.la@www.98T.la@高清.mp4", False, None),
+            ("www.98T.la高清.mp4", False, None),
             ("http://98T.la@IPX_939.mp4", False, "IPX-939"),
             ("https://98T.la@IPX-939-CD2.mp4", False, "IPX-939"),
             ("IPX-939@备注.mp4", False, "IPX-939"),
@@ -266,9 +273,10 @@ class DirectAcceptanceTests(unittest.TestCase):
             for first, second, numbers, failures in cases:
                 with self.subTest(version=version, files=(first, second)), tempfile.TemporaryDirectory() as directory:
                     m, cloud, metadata, service = self.make(directory, version)
+                    original_names = ("www.98T.la@www.98T.la@" + first, "www.98T.la" + second)
                     cloud.entries = {
-                        str(index): m.Entry(str(index), "0", "www.98T.la@" + name, pickcode=str(index) * 17)
-                        for index, name in enumerate((first, second), 1)
+                        str(index): m.Entry(str(index), "0", name, pickcode=str(index) * 17)
+                        for index, name in enumerate(original_names, 1)
                     }
                     service.extract_number = extract
                     result = service.run(["0"])

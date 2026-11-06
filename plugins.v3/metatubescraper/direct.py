@@ -291,10 +291,16 @@ def _part(name):
     return "-CD" + str(int(match[1])) if match else ""
 
 
+class NumberConflict(CloudError):
+    def __init__(self, filenames):
+        super().__init__("同番号存在不同版本或重复分段，请先分目录处理")
+        self.filenames = filenames
+
+
 class DirectService(PlaybackService):
     def __init__(self, client, data_dir, output_root, playback_base_url, metadata,
                  artwork, build_nfo, extract_number, stop_event=None, force=False, plugin_id="MetaTubeScraper",
-                 debug=None, info=None, archive_loose=False):
+                 debug=None, info=None, archive_loose=False, error=None):
         self.client = client
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", plugin_id):
             raise CloudError("插件实例标识无效")
@@ -312,6 +318,7 @@ class DirectService(PlaybackService):
         self.build_nfo, self.extract_number = build_nfo, extract_number
         self._debug = debug or (lambda message: None)
         self._info = info or (lambda message: None)
+        self._error = error or (lambda message: None)
         self.stop_event = stop_event or threading.Event()
         self.force = force
         self.archive_loose = archive_loose
@@ -329,14 +336,15 @@ class DirectService(PlaybackService):
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", number):
             raise CloudError("番号不适合作为输出目录")
         all_videos = [e for e in entries if not e.is_dir and Path(e.name).suffix.lower() in VIDEO_EXTS]
-        names, plans = set(), []
+        filenames_by_stem, plans = {}, []
         video_ids = {e.id for e in videos}
         for entry in videos:
             stem = number + _part(entry.name)
-            if stem.casefold() in names:
-                raise CloudError("同番号存在不同版本或重复分段，请先分目录处理")
-            names.add(stem.casefold())
+            filenames_by_stem.setdefault(stem.casefold(), []).append(entry.name)
             plans.append({"entry": asdict(entry), "target": stem + Path(entry.name).suffix.lower(), "kind": "video"})
+        conflicts = [name for names in filenames_by_stem.values() if len(names) > 1 for name in names]
+        if conflicts:
+            raise NumberConflict(conflicts)
         stems = {p["entry"]["id"]: Path(p["target"]).stem for p in plans}
         for entry in entries:
             if entry.is_dir or Path(entry.name).suffix.lower() not in SUBTITLE_EXTS:
@@ -689,6 +697,7 @@ class DirectService(PlaybackService):
                         groups.setdefault(number, []).append(entry)
                     else:
                         stats["nomatch"] += 1
+                        self._error(f"番号未识别 目录={display!r} 原文件名={entry.name!r}")
                 else:
                     self._debug(f"扫描文件 目录={display!r} 原文件名={entry.name!r} 类型=非视频")
             if depth == 0:
@@ -740,6 +749,8 @@ class DirectService(PlaybackService):
                     status = "fail"
                     message = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
                     stats["errors"].append(number + "：" + message)
+                    if isinstance(exc, NumberConflict):
+                        self._error(f"番号冲突 目录={display!r} 番号={number} 原文件名={exc.filenames!r} 原因={message}")
                 stats[status] += 1
                 reason = " 原因=已有完整产物" if status == "skip" and not destination else ""
                 self._debug(f"刮削结果 番号={number} 状态={status}{reason}")

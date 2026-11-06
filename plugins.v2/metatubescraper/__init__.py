@@ -370,7 +370,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.8"
+    plugin_version = "1.1.9"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -607,7 +607,7 @@ class MetaTubeScraper(_PluginBase):
                     metadata=metadata, artwork=artwork, build_nfo=backend.__build_nfo,
                     extract_number=lambda text: backend.__extract_number(text, backend._numeric_ids),
                     stop_event=self._stop_event, force=self._force, plugin_id=self.__class__.__name__,
-                    debug=backend.debug, info=backend.info,
+                    debug=backend.debug, info=backend.info, error=backend.error,
                     archive_loose=self._archive_loose,
                 )
             return self._direct_service
@@ -631,9 +631,12 @@ class MetaTubeScraper(_PluginBase):
     def __extract_number(text: str, numeric_ids: bool = False) -> Optional[str]:
         if not text:
             return None
-        # Strip the website watermark before dots become number separators.
+        # Strip repeated website watermarks. The known 98T.la prefix can omit @.
         text = re.sub(
-            r"^\s*(?:https?://)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\?\.)+[a-z]{2,63}\s*@\s*",
+            r"^\s*(?:(?:https?://)?(?:"
+            r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\?\.)+[a-z]{2,63}\s*@"
+            r"|(?:www\\?\.)?98t\\?\.la"
+            r")\s*)+",
             "", text, count=1, flags=re.IGNORECASE | re.ASCII,
         )
         t = re.sub(r"[\s_.]+", "-", text.upper())
@@ -1135,6 +1138,7 @@ class MetaTubeScraper(_PluginBase):
                 source = "目录名" if number else "无"
             self.debug(f"番号识别 目录={dir_path!r} 原文件名={video_name!r} 番号={number or '未识别'} 来源={source}")
             if not number:
+                self.error(f"番号未识别 目录={dir_path!r} 原文件名={video_name!r}")
                 return "nomatch"
 
             result, provider = self.__search_movie(number)
