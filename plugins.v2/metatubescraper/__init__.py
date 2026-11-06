@@ -323,7 +323,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.6"
+    plugin_version = "1.1.7"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -575,6 +575,11 @@ class MetaTubeScraper(_PluginBase):
     def __extract_number(text: str, numeric_ids: bool = False) -> Optional[str]:
         if not text:
             return None
+        # Strip the website watermark before dots become number separators.
+        text = re.sub(
+            r"^\s*(?:https?://)?(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\\?\.)+[a-z]{2,63}\s*@\s*",
+            "", text, count=1, flags=re.IGNORECASE | re.ASCII,
+        )
         t = re.sub(r"[\s_.]+", "-", text.upper())
 
         m = re.search(r"(?<![A-Z0-9])FC2(?:-PPV)?-(\d{6,9})(?!\d)", t)

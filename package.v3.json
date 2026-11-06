@@ -1,12 +1,13 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.1.6",
+    "version": "1.1.7",
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
     "v3": true,
     "history": {
+      "v1.1.7": "识别番号前过滤文件名开头的域名水印，修复 IPX-939 等视频被误分到 WWW-098。",
       "v1.1.6": "修复稳定播放标识并发登记；支持核验后恢复旧 STRM 链接，校验绝对输出目录，兼容插件分身；播放缺少数据库时明确报错。",
       "v1.1.5": "扫描目录改用弹窗选择，点击文件夹进入并确认添加；取消不改变扫描范围，保留中文路径、稳定 ID 和已有配置。",
       "v1.1.4": "115 Cookie 直连显示中文目录路径和扫描标签，后台保留稳定 ID；导航失败保留原位置，兼容旧配置，无额外父目录请求。",

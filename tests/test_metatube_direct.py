@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+from test_metatube_auth import load_plugin
+
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -87,6 +89,54 @@ class DirectAcceptanceTests(unittest.TestCase):
         )
         self.addCleanup(service.close)
         return m, cloud, metadata, service
+
+    def test_number_extraction_ignores_leading_website_watermarks(self):
+        cases = (
+            ("IPX-939.mp4", False, "IPX-939"),
+            ("www.98T.la@IPX-939.mp4", False, "IPX-939"),
+            (r"www\.98T.la@ipx939.mkv", False, "IPX-939"),
+            ("http://98T.la@IPX_939.mp4", False, "IPX-939"),
+            ("https://98T.la@IPX-939-CD2.mp4", False, "IPX-939"),
+            ("IPX-939@备注.mp4", False, "IPX-939"),
+            ("IPX-939@www.98T.la.mp4", False, "IPX-939"),
+            ("IPX-939.avi", False, "IPX-939"),
+            ("www.98T.la@高清.mp4", False, None),
+            ("www.98T.la@FC2-PPV-1234567.mp4", False, "FC2-PPV-1234567"),
+            ("www.98T.la@259LUXU-1234.mp4", False, "259LUXU-1234"),
+            ("www.98T.la@123456-001.mp4", False, None),
+            ("www.98T.la@123456-001.mp4", True, "123456-001"),
+        )
+        for version in ("v2", "v3"):
+            extract = load_plugin(version, Mock())._MetaTubeScraper__extract_number
+            for name, numeric_ids, expected in cases:
+                with self.subTest(version=version, name=name, numeric_ids=numeric_ids):
+                    self.assertEqual(extract(name, numeric_ids), expected)
+
+    def test_watermarked_videos_group_by_number_and_keep_real_conflicts(self):
+        cases = (
+            ("IPX-939.mp4", "IPX-940.mp4", ["IPX-939", "IPX-940"], 0),
+            ("IPX-939.mp4", "IPX-939.mkv", [], 1),
+            ("IPX-939-CD1.mp4", "IPX-939-CD2.mp4", ["IPX-939"], 0),
+        )
+        for version in ("v2", "v3"):
+            extract = load_plugin(version, Mock())._MetaTubeScraper__extract_number
+            for first, second, numbers, failures in cases:
+                with self.subTest(version=version, files=(first, second)), tempfile.TemporaryDirectory() as directory:
+                    m, cloud, metadata, service = self.make(directory, version)
+                    cloud.entries = {
+                        str(index): m.Entry(str(index), "0", "www.98T.la@" + name, pickcode=str(index) * 17)
+                        for index, name in enumerate((first, second), 1)
+                    }
+                    service.extract_number = extract
+                    result = service.run(["0"])
+                    self.assertEqual(result["fail"], failures)
+                    self.assertEqual(result["ok"], len(numbers))
+                    self.assertEqual([call.args[0] for call in metadata.call_args_list], numbers)
+                    if failures:
+                        self.assertIn("同番号存在不同版本或重复分段", " ".join(result["errors"]))
+                        self.assertEqual(cloud.renames, [])
+                    else:
+                        self.assertEqual([name for _, name in cloud.renames], [first, second])
 
     def test_independent_pipeline_and_idempotence_both_versions(self):
         for version in ("v2", "v3"):
