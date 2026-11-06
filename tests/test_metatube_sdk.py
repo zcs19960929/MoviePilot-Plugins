@@ -29,9 +29,16 @@ class PinnedSDKTests(unittest.TestCase):
                 def request(sdk, url, method="GET", **kwargs):
                     calls.append((url, method, kwargs))
                     if url.endswith("/files/get_info"):
-                        return {"state": True, "data": [{"fid": "1", "cid": "0", "n": file["file_name"], "pc": "a" * 17, "s": 10}]}
+                        return {"state": True, "data": [{"fid": "1", "cid": file["category_id"], "n": file["file_name"], "pc": "a" * 17, "s": 10}]}
                     if url.endswith("/files/batch_rename"):
                         file["file_name"] = kwargs["data"]["files_new_name[1]"]
+                        return {"state": True}
+                    if url.endswith("/files/add"):
+                        self.assertEqual(kwargs["data"], {"cname": "DSOD-060", "pid": "0"})
+                        return {"state": True, "cid": "7"}
+                    if url.endswith("/files/move"):
+                        self.assertEqual(kwargs["data"], {"fid[0]": "1", "pid": "7"})
+                        file["category_id"] = "7"
                         return {"state": True}
                     if url.endswith("/files"):
                         return {"state": True, "count": 1, "path": [{"cid": "0"}], "data": [
@@ -48,6 +55,9 @@ class PinnedSDKTests(unittest.TestCase):
                     self.assertEqual(client.info("1").name, "original.ass")
                     client.rename("1", "DSOD-060.zh.ass")
                     self.assertEqual(client.info("1").name, "DSOD-060.zh.ass")
+                    destination = client.mkdir("DSOD-060", "0")
+                    client.move(["1"], destination)
+                    self.assertEqual(client.info("1").parent_id, "7")
                     link = client.download_link(client.info("1"), "Emby")
                     self.assertEqual(link.url, "https://cdn.115.com/subtitle?t=4102444800")
                     response = Mock(status_code=200)

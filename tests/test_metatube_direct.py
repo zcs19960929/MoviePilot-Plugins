@@ -39,6 +39,9 @@ class FakeCloud:
         self.module = module
         self.entries = {e.id: e for e in entries}
         self.renames = []
+        self.directories = []
+        self.moves = []
+        self.interrupt_move_after = None
         self.downloads = []
         self.links = []
         self.fail_rename = None
@@ -61,6 +64,20 @@ class FakeCloud:
         if fid == self.raise_after_rename:
             self.raise_after_rename = None
             raise RuntimeError("response lost after successful rename")
+
+    def mkdir(self, name, parent_id):
+        fid = str(max(map(int, self.entries), default=0) + 1)
+        self.entries[fid] = self.module.Entry(fid, parent_id, name, is_dir=True)
+        self.directories.append((name, parent_id))
+        return fid
+
+    def move(self, file_ids, parent_id):
+        self.moves.append((list(file_ids), parent_id))
+        for fid in file_ids:
+            self.entries[fid] = dataclasses.replace(self.entries[fid], parent_id=parent_id)
+            if fid == self.interrupt_move_after:
+                self.interrupt_move_after = None
+                raise RuntimeError("simulated partial move")
 
     def download_bytes(self, entry):
         self.downloads.append(entry.id)
@@ -89,6 +106,132 @@ class DirectAcceptanceTests(unittest.TestCase):
         )
         self.addCleanup(service.close)
         return m, cloud, metadata, service
+
+    def test_archive_existing_loose_video_and_subtitle_keeps_strm_and_nested_files(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                cloud.entries = {e.id: e for e in (
+                    m.Entry("7", "0", "jav", is_dir=True),
+                    m.Entry("1", "7", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
+                    m.Entry("2", "7", "www.98T.la@IPX-939.zh.ass", pickcode="b" * 17),
+                    m.Entry("8", "7", "IPX-940", is_dir=True),
+                    m.Entry("3", "8", "IPX-940.mp4", pickcode="c" * 17),
+                )}
+                service.extract_number = load_plugin(version, Mock())._MetaTubeScraper__extract_number
+                self.assertEqual(service.run(["7"])["ok"], 2)
+                self.assertEqual(cloud.moves, [])
+                strm = Path(directory)/"library/IPX-939/IPX-939.strm"
+                original = strm.read_bytes()
+                service.archive_loose = True
+                self.assertEqual(service.run(["7"])["ok"], 1)
+                self.assertEqual(cloud.directories, [("IPX-939", "7")])
+                target = next(e for e in cloud.entries.values() if e.is_dir and e.name == "IPX-939")
+                self.assertEqual(cloud.moves, [(["1", "2"], target.id)])
+                self.assertEqual(cloud.entries["1"].name, "IPX-939.mp4")
+                self.assertEqual(cloud.entries["2"].name, "IPX-939.zh.ass")
+                self.assertEqual(cloud.entries["3"].parent_id, "8")
+                self.assertEqual(strm.read_bytes(), original)
+                token = original.decode().strip().split("media_id=")[1]
+                self.assertEqual(service.registry.media(cloud.account, token).parent_id, target.id)
+                self.assertEqual(service.run(["7"])["skip"], 2)
+                self.assertEqual(len(cloud.moves), 1)
+                self.assertEqual(metadata.call_count, 2)
+
+    def test_archive_renames_movie_folder_and_files_in_place(self):
+        for version in ("v2", "v3"):
+            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
+                m, cloud, metadata, service = self.make(directory, version)
+                cloud.entries = {e.id: e for e in (
+                    m.Entry("7", "0", "jav", is_dir=True),
+                    m.Entry("8", "7", "www.98T.la@IPX-939", is_dir=True),
+                    m.Entry("1", "8", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
+                    m.Entry("2", "8", "www.98T.la@IPX-939.zh.forced.ass", pickcode="b" * 17),
+                )}
+                service.extract_number = load_plugin(version, Mock())._MetaTubeScraper__extract_number
+                service.archive_loose = True
+                self.assertEqual(service.run(["7"])["ok"], 1)
+                self.assertEqual(cloud.entries["8"], m.Entry("8", "7", "IPX-939", is_dir=True))
+                self.assertEqual(cloud.entries["1"].name, "IPX-939.mp4")
+                self.assertEqual(cloud.entries["2"].name, "IPX-939.zh.forced.ass")
+                self.assertEqual([cloud.entries[fid].parent_id for fid in ("1", "2")], ["8", "8"])
+                self.assertEqual(cloud.directories, [])
+                self.assertEqual(cloud.moves, [])
+                self.assertEqual(cloud.renames[-1], ("8", "IPX-939"))
+                strm = Path(directory)/"library/IPX-939/IPX-939.strm"
+                original = strm.read_bytes()
+                self.assertEqual(service.run(["7"])["skip"], 1)
+                self.assertEqual(strm.read_bytes(), original)
+                self.assertEqual(metadata.call_count, 1)
+                self.assertEqual(len(cloud.renames), 3)
+
+    def test_movie_folder_name_collision_is_checked_before_file_renames(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m, cloud, metadata, service = self.make(directory)
+            cloud.entries = {e.id: e for e in (
+                m.Entry("8", "0", "www.98T.la@IPX-939", is_dir=True),
+                m.Entry("9", "0", "ipx-939", is_dir=True),
+                m.Entry("1", "8", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
+            )}
+            service.archive_loose = True
+            result = service.run(["0"])
+            self.assertEqual(result["fail"], 1)
+            self.assertIn("同名", " ".join(result["errors"]))
+            self.assertEqual(cloud.renames, [])
+            metadata.assert_not_called()
+
+    def test_mixed_movie_folder_is_not_renamed_to_a_single_number(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m, cloud, metadata, service = self.make(directory)
+            cloud.entries = {e.id: e for e in (
+                m.Entry("8", "0", "多部影片", is_dir=True),
+                m.Entry("1", "8", "IPX-939.mp4", pickcode="a" * 17),
+                m.Entry("2", "8", "IPX-940.mp4", pickcode="b" * 17),
+            )}
+            service.archive_loose = True
+            self.assertEqual(service.run(["0"])["ok"], 2)
+            self.assertEqual(cloud.entries["8"].name, "多部影片")
+            self.assertEqual(cloud.renames, [])
+
+    def test_archive_resumes_when_video_moved_before_subtitle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m, cloud, metadata, service = self.make(directory)
+            service.archive_loose = True
+            unrelated = m.Entry("99", "0", "unrelated.en.srt", pickcode="c" * 17)
+            cloud.entries[unrelated.id] = unrelated
+            cloud.interrupt_move_after = "1"
+            self.assertEqual(service.run(["0"])["fail"], 1)
+            self.assertNotEqual(cloud.entries["1"].parent_id, "0")
+            self.assertEqual(cloud.entries["2"].parent_id, "0")
+            target = cloud.entries["1"].parent_id
+            strm = Path(directory)/"library/DSOD-060/DSOD-060.strm"
+            original = strm.read_bytes()
+            service.close()
+            service.registry.reopen()
+            service.archive_loose = False
+            service.run(["0"])
+            self.assertEqual(cloud.moves, [(["1", "2"], target)])
+            service.archive_loose = True
+            self.assertEqual(service.run(["0"])["ok"], 1)
+            self.assertEqual(cloud.moves, [(["1", "2"], target), (["2"], target)])
+            self.assertEqual(cloud.entries["2"].parent_id, target)
+            self.assertEqual(cloud.entries[unrelated.id], unrelated)
+            self.assertEqual(strm.read_bytes(), original)
+            self.assertEqual(service.run(["0"])["skip"], 1)
+            self.assertEqual(metadata.call_count, 1)
+
+    def test_archive_destination_with_unrelated_file_preserves_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            m, cloud, metadata, service = self.make(directory)
+            service.archive_loose = True
+            cloud.entries["10"] = m.Entry("10", "0", "DSOD-060", is_dir=True)
+            cloud.entries["11"] = m.Entry("11", "10", "existing.txt")
+            result = service.run(["0"])
+            self.assertEqual(result["fail"], 1)
+            self.assertIn("目标番号目录", " ".join(result["errors"]))
+            self.assertEqual(cloud.renames, [])
+            self.assertEqual(cloud.directories, [])
+            self.assertEqual(cloud.moves, [])
 
     def test_number_extraction_ignores_leading_website_watermarks(self):
         cases = (
@@ -548,6 +691,27 @@ class AdapterTests(unittest.TestCase):
         with self.assertRaises(m.CloudError) as caught:
             client.listdir("0")
         self.assertNotIn("do-not-echo", str(caught.exception))
+
+    def test_sdk_debug_reports_response_codes_and_pages_without_private_data(self):
+        m = components()
+        debug = Mock()
+        sdk = types.SimpleNamespace(
+            fs_files=Mock(side_effect=[
+                {"state": True, "count": 1, "data": [{"fid": "1", "cid": "0", "n": "film.mp4", "pc": "private-pickcode"}]},
+                {"state": False, "errno": 911, "error": "Cookie=private-cookie"},
+            ]),
+            download_url=Mock(return_value="https://cdn.example/video?sign=private-link"),
+        )
+        client = m.Cloud115("UID=12345_A1; CID=fixture; SEID=fixture", sdk=sdk, interval=0, debug=debug)
+        entry = client.listdir("0")[0]
+        client.download_link(entry)
+        with self.assertRaises(m.RiskError):
+            client.listdir("0")
+        logs = "\n".join(call.args[0] for call in debug.call_args_list)
+        for detail in ("fs_files", "数据条数", "offset", "download_url", "errno", "911"):
+            self.assertIn(detail, logs)
+        for secret in ("private-pickcode", "private-cookie", "private-link"):
+            self.assertNotIn(secret, logs)
 
 
 if __name__ == "__main__":

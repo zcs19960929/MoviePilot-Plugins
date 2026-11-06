@@ -43,7 +43,7 @@ class DirectLink:
 
 
 class Cloud115:
-    def __init__(self, cookie, interval=5, stop_event=None, sdk=None):
+    def __init__(self, cookie, interval=5, stop_event=None, sdk=None, debug=None):
         parsed = SimpleCookie()
         try:
             parsed.load(cookie or "")
@@ -58,6 +58,7 @@ class Cloud115:
         self.interval = max(0, float(interval))
         self._lock = threading.RLock()
         self._last_request = 0.0
+        self._debug = debug
         self._directory_paths = {"0": "/"}
         if sdk is None:
             if sys.version_info < (3, 12):
@@ -99,15 +100,44 @@ class Cloud115:
                 # response to OSError.args; preserve risk classification, not its text.
                 for argument in exc.args:
                     if isinstance(argument, dict):
+                        self._debug_response(method, args, argument)
                         self._check(argument)
                 status = (getattr(getattr(exc, "response", None), "status_code", None)
                           or getattr(exc, "status", None) or getattr(exc, "code", None))
+                if self._debug:
+                    code = status if isinstance(status, int) else "未知"
+                    self._debug(f"115 {method} 请求异常={type(exc).__name__} HTTP={code}")
                 if status in (405, 429) or "Risk" in type(exc).__name__:
                     raise RiskError("115 请求受到限制，请检查账户状态") from None
                 if status in (401, 403) or any(name in type(exc).__name__ for name in ("Login", "Authentication")):
                     raise AuthenticationError("115 Cookie 无效或权限不足") from None
                 raise CloudError("115 请求失败（" + type(exc).__name__ + "）") from None
+            self._debug_response(method, args, result)
             return self._check(result)
+
+    def _debug_response(self, method, args, response):
+        if not self._debug:
+            return
+
+        def numbers(values, names):
+            result = {}
+            for name in names:
+                value = values.get(name)
+                if isinstance(value, int) or (isinstance(value, str) and value.isdecimal()):
+                    result[name] = value
+            return result
+
+        # Log only known status/pagination fields. SDK results can contain
+        # Cookie headers, pickcodes and signed playback URLs.
+        request = numbers(args[0], ("cid", "file_id", "offset", "limit")) if args and isinstance(args[0], dict) else {}
+        details = {"类型": type(response).__name__}
+        if isinstance(response, dict):
+            details.update(numbers(response, ("state", "errno", "errNo", "errcode", "code", "error_code",
+                                              "count", "offset", "limit", "page_size")))
+            data = response.get("data")
+            if isinstance(data, (list, dict)):
+                details["数据条数"] = len(data)
+        self._debug(f"115 {method} 参数={request} 响应={details}")
 
     @staticmethod
     def _entry(raw):
@@ -234,6 +264,20 @@ class Cloud115:
             raise CloudError("目标文件名无效")
         self._call("fs_rename", (str(fid), name))
 
+    def mkdir(self, name, parent_id):
+        if not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", name):
+            raise CloudError("归档目录名称无效")
+        result = self._call("fs_mkdir", {"cname": name, "pid": str(parent_id)})
+        cid = str(result.get("cid") or result.get("file_id") or "")
+        if not cid.isdecimal() or cid in ("0", str(parent_id)):
+            raise CloudError("115 未返回有效的归档目录 ID")
+        return cid
+
+    def move(self, file_ids, parent_id):
+        if not file_ids or not str(parent_id).isdecimal() or str(parent_id) == "0":
+            raise CloudError("归档目标目录无效")
+        self._call("fs_move", tuple(file_ids), pid=str(parent_id))
+
     def download_link(self, entry, user_agent="", background=False):
         if not entry.pickcode:
             raise CloudError("文件缺少 pickcode，无法获取下载链接")
@@ -258,6 +302,8 @@ class Cloud115:
             try:
                 with requests.get(link.url, headers=link.headers, timeout=60,
                                   stream=True, allow_redirects=False) as response:
+                    if self._debug:
+                        self._debug(f"115 字幕下载 原文件名={entry.name!r} HTTP {response.status_code}")
                     if response.status_code != 200:
                         raise CloudError("字幕下载失败，请检查 115 直链权限")
                     chunks, length = [], 0
@@ -271,6 +317,8 @@ class Cloud115:
                     data = b"".join(chunks)
                     if not data:
                         raise CloudError("字幕下载结果为空")
+                    if self._debug:
+                        self._debug(f"115 字幕下载 原文件名={entry.name!r} 数据长度={len(data)}")
                     return data
             except CloudError:
                 raise

@@ -10,6 +10,41 @@ import test_metatube_direct as fixtures
 
 
 class HostTests(unittest.TestCase):
+    def test_direct_scan_logs_readable_root_and_number_without_extra_cloud_reads(self):
+        for version in ("v2", "v3"):
+            for labels in ({}, {"id:7": "/影片/新片"}):
+                with self.subTest(version=version, labels=labels), tempfile.TemporaryDirectory() as directory:
+                    m = fixtures.components(version)
+                    cloud = fixtures.FakeCloud(m, [
+                        m.Entry("7", "0", "新片", is_dir=True),
+                        m.Entry("8", "7", "www.98T.la@IPX-939.mp4", pickcode="p" * 17),
+                        m.Entry("9", "7", "未命名.mp4", pickcode="q" * 17),
+                    ])
+                    cloud.info = Mock(wraps=cloud.info)
+                    cloud.listdir = Mock(wraps=cloud.listdir)
+                    cloud.directory_path = lambda cid: "/影片/新片" if cloud.listdir.called else None
+                    reply = types.SimpleNamespace(status_code=200, json=lambda: {"data": []})
+                    plugin = load_plugin(version, Mock(return_value=reply))
+                    plugin.init_plugin(dict(enabled=True, storage="115_direct", scan_dirs="id:7",
+                                            dir_labels=labels, cookie115="fixture", metatube_url="http://backend",
+                                            local_strm_root=str(Path(directory)/"library"),
+                                            playback_base_url="https://mp.example"))
+                    plugin._cloud115 = cloud
+                    plugin.get_data_path = lambda: Path(directory)/"state"
+                    plugin.info, plugin.debug, plugin.save_data = Mock(), Mock(), Mock()
+                    plugin._MetaTubeScraper__scrape_all()
+                    self.addCleanup(plugin._direct_service.close)
+                    info = [call.args[0] for call in plugin.info.call_args_list]
+                    debug = [call.args[0] for call in plugin.debug.call_args_list]
+                    start = next(line for line in info if "刮削开始" in line)
+                    self.assertIn("/影片/新片" if labels else "待解析", start)
+                    self.assertNotIn("id:7", start)
+                    self.assertTrue(any("扫描目录已解析" in line and "/影片/新片" in line for line in info))
+                    self.assertTrue(any("www.98T.la@IPX-939.mp4" in line and "番号=IPX-939" in line for line in debug))
+                    self.assertTrue(any("未命名.mp4" in line and "番号=未识别" in line for line in debug))
+                    cloud.info.assert_called_once_with("7")
+                    cloud.listdir.assert_called_once_with("7")
+
     def test_configuration_reload_before_client_creation_cancels_the_original_job(self):
         for version in ('v2','v3'):
             plugin=load_plugin(version,Mock())
@@ -53,6 +88,7 @@ class HostTests(unittest.TestCase):
                 try:
                     self.assertTrue(entered.wait(2))
                     plugin.init_plugin(dict(config, run_msg='运行中', cookie115_msg='Cookie 可用',
+                                            dir_labels={'id:0': '/'},
                                             storage={'value':'115_direct'}, cron_hour='4',
                                             schedule_mode='interval', schedule_interval=90))
                     self.assertFalse(cloud.stop_event.is_set())
@@ -103,7 +139,7 @@ class HostTests(unittest.TestCase):
         plugin.init_plugin({"cookie115": "account-A", "storage": "115_direct"})
         entered, release, reloaded = threading.Event(), threading.Event(), threading.Event()
         clients = []
-        def factory(cookie, interval, stop_event):
+        def factory(cookie, interval, stop_event, debug=None):
             client = types.SimpleNamespace(account=cookie, stop_event=stop_event)
             clients.append(client)
             if cookie == "account-A":

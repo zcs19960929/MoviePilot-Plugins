@@ -152,7 +152,7 @@ class FormTests(unittest.TestCase):
                 with self.subTest(version=version, storage=storage):
                     fields = self.render(version, storage=storage, download_previews=True)['snapshots'][0]
                     self.assertFalse(hidden & fields.keys(), hidden & fields.keys())
-                    self.assertTrue({'cookie115', 'playback_base_url', 'cloud_interval', 'local_strm_root'} <= fields.keys())
+                    self.assertTrue({'cookie115', 'playback_base_url', 'cloud_interval', 'local_strm_root', 'archive_loose'} <= fields.keys())
                     self.assertIn('补齐', fields['force_overwrite']['hint'])
 
     def test_schedule_modes_show_only_their_fields_and_retain_other_values(self):
@@ -184,14 +184,15 @@ class FormTests(unittest.TestCase):
             with self.subTest(version=version):
                 local = self.render(version, storage='local')['snapshots'][0]
                 self.assertFalse({'cookie115', 'playback_base_url', 'cloud_interval', 'write_local',
-                                  'write_remote', 'remote_lib_root', 'local_strm_root', 'organize', 'trigger_strm'} & local.keys())
+                                  'write_remote', 'remote_lib_root', 'local_strm_root', 'organize', 'trigger_strm',
+                                  'archive_loose'} & local.keys())
                 self.assertNotIn('preview_limit', local)
                 self.assertIn('preview_limit', self.render(version, storage='local', download_previews=True)['snapshots'][0])
                 lite = self.render(version, storage='115Lite', organize=True, write_remote=True)['snapshots'][0]
-                self.assertFalse({'write_remote', 'organize', 'cookie115'} & lite.keys())
+                self.assertFalse({'write_remote', 'organize', 'cookie115', 'archive_loose'} & lite.keys())
                 self.assertTrue({'write_local', 'trigger_strm', 'remote_lib_root', 'local_strm_root', 'rename_files'} <= lite.keys())
                 cloud = self.render(version, storage='u115', write_local=False, write_remote=True, organize=False)['snapshots'][0]
-                self.assertFalse({'remote_lib_root', 'local_strm_root'} & cloud.keys())
+                self.assertFalse({'remote_lib_root', 'local_strm_root', 'archive_loose'} & cloud.keys())
                 cloud = self.render(version, storage='alist', write_local=False, write_remote=True, organize=True)['snapshots'][0]
                 self.assertIn('remote_lib_root', cloud)
                 self.assertNotIn('local_strm_root', cloud)

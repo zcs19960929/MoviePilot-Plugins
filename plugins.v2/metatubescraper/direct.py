@@ -116,6 +116,33 @@ class Registry:
             self.db.execute("INSERT OR REPLACE INTO jobs VALUES(?,?,?,?)",
                             (account, job, json.dumps(plan, ensure_ascii=False), int(complete)))
 
+    def pending_archives(self, account):
+        with self._lock:
+            rows = self.db.execute(
+                "SELECT job,plan FROM jobs WHERE account=? AND plan LIKE ?", (account, '%"archive_to"%'))
+            return {row["job"]: target for row in rows
+                    if (target := json.loads(row["plan"]).get("archive_to"))}
+
+    def finish_archive(self, account, job, target_job, plan, entries):
+        relocated = dict(plan)
+        relocated.pop("archive_to")
+        relocated["files"] = [
+            dict(item, entry=asdict(entries[item["entry"]["id"]])) for item in plan["files"]
+        ]
+        with self._lock, self.db:
+            self.check_identity()
+            self.db.execute("BEGIN IMMEDIATE")
+            if self.job(account, job) != (plan, True) or self.job(account, target_job)[0] is not None:
+                raise CloudError("归档记录已变化，请检查目标番号目录")
+            self.db.execute("UPDATE jobs SET job=?,plan=? WHERE account=? AND job=?",
+                            (target_job, json.dumps(relocated, ensure_ascii=False), account, job))
+            self.db.execute("UPDATE outputs SET job=? WHERE account=? AND job=?", (target_job, account, job))
+            for item in relocated["files"]:
+                if item["kind"] == "video":
+                    entry = item["entry"]
+                    self.db.execute("UPDATE media SET entry=? WHERE account=? AND fid=?",
+                                    (json.dumps(entry), account, entry["id"]))
+
     def _media_token(self, account, entry):
         # Acquire the SQLite write lock before reading. Independent Registry
         # connections/processes must never replace another returned capability.
@@ -266,7 +293,8 @@ def _part(name):
 
 class DirectService(PlaybackService):
     def __init__(self, client, data_dir, output_root, playback_base_url, metadata,
-                 artwork, build_nfo, extract_number, stop_event=None, force=False, plugin_id="MetaTubeScraper"):
+                 artwork, build_nfo, extract_number, stop_event=None, force=False, plugin_id="MetaTubeScraper",
+                 debug=None, info=None, archive_loose=False):
         self.client = client
         if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]*", plugin_id):
             raise CloudError("插件实例标识无效")
@@ -282,8 +310,11 @@ class DirectService(PlaybackService):
         self.registry = Registry(data_dir, self.root)
         self.metadata, self.artwork = metadata, artwork
         self.build_nfo, self.extract_number = build_nfo, extract_number
+        self._debug = debug or (lambda message: None)
+        self._info = info or (lambda message: None)
         self.stop_event = stop_event or threading.Event()
         self.force = force
+        self.archive_loose = archive_loose
         self._cache = {}
         self._play_lock = threading.RLock()
 
@@ -294,7 +325,7 @@ class DirectService(PlaybackService):
         if self.stop_event.is_set():
             raise Stopped("任务已停止")
 
-    def _plan(self, number, videos, entries):
+    def _plan(self, number, videos, entries, archive=False):
         if not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", number):
             raise CloudError("番号不适合作为输出目录")
         all_videos = [e for e in entries if not e.is_dir and Path(e.name).suffix.lower() in VIDEO_EXTS]
@@ -322,6 +353,9 @@ class DirectService(PlaybackService):
             if matches:
                 length = max(m[0] for m in matches)
                 matches = [m for m in matches if m[0] == length]
+            elif archive:
+                # Loose subtitles can belong to videos elsewhere in this root.
+                continue
             elif len(all_videos) == 1:
                 tail = source_stem
                 other_number = self.extract_number(tail)
@@ -385,14 +419,14 @@ class DirectService(PlaybackService):
         if (current.st_dev, current.st_ino) != (identity.st_dev, identity.st_ino):
             raise CloudError("本地输出目录身份发生变化，已停止处理")
 
-    def _process(self, number, videos, entries):
+    def _process(self, number, videos, entries, archive=False):
         self._stopped()
         account = self.client.account
         job = videos[0].parent_id + ":" + number
         plan, complete = self.registry.job(account, job)
         was_complete = complete
         if plan is None:
-            plan = self._plan(number, videos, entries)
+            plan = self._plan(number, videos, entries, archive)
             info = self.metadata(number)
             if not info or not info.get("title"):
                 return "notfound"
@@ -414,7 +448,7 @@ class DirectService(PlaybackService):
         originals = {p["entry"]["id"]: p["entry"]["name"] for p in plan["files"]}
         naming_entries = [replace(e, name=originals.get(e.id, e.name)) for e in actual.values()]
         video_ids = {e.id for e in videos}
-        reconciled = self._plan(number, [e for e in naming_entries if e.id in video_ids], naming_entries)
+        reconciled = self._plan(number, [e for e in naming_entries if e.id in video_ids], naming_entries, archive)
         if {p["entry"]["id"] for p in reconciled["files"]} != set(originals):
             reconciled["metadata"] = plan["metadata"]
             plan = reconciled
@@ -507,6 +541,102 @@ class DirectService(PlaybackService):
             self.registry.save_job(account, job, plan, complete=True)
         return "ok"
 
+    @staticmethod
+    def _archive_destination(entries, number):
+        matches = [entry for entry in entries if entry.name.casefold() == number.casefold()]
+        if not matches:
+            return None
+        if len(matches) != 1 or not matches[0].is_dir or matches[0].name != number:
+            raise CloudError("目标番号目录名称冲突，已跳过归档")
+        return matches[0].id
+
+    def _archive(self, parent, number, destination):
+        self._stopped()
+        self.registry.check_identity()
+        account, job = self.client.account, f"{parent}:{number}"
+        plan, complete = self.registry.job(account, job)
+        if not complete:
+            raise CloudError("本地刮削尚未完成，已跳过归档")
+        source = self.client.listdir(parent)
+        existing = self._archive_destination(source, number)
+        if existing != destination:
+            raise CloudError("目标番号目录已变化，已跳过归档")
+        if destination is None:
+            self._stopped()
+            destination = self.client.mkdir(number, parent)
+            source = self.client.listdir(parent)
+            if self._archive_destination(source, number) != destination:
+                raise CloudError("无法确认新建的目标番号目录，已跳过归档")
+        target_job = f"{destination}:{number}"
+        if self.registry.job(account, target_job)[0] is not None:
+            raise CloudError("目标番号目录已有刮削记录，已跳过归档")
+
+        # Preserve the original job and output ownership until all moved IDs
+        # have been verified. A partial move can resume even if no video is
+        # left in the source directory.
+        if plan.get("archive_to") != destination:
+            plan["archive_to"] = destination
+            self.registry.save_job(account, job, plan, complete=True)
+        expected = {item["entry"]["id"]: item["target"] for item in plan["files"]}
+        source_files = {entry.id: entry for entry in source}
+        target_files = {entry.id: entry for entry in self.client.listdir(destination)}
+        if any(entry.is_dir or expected.get(fid) != entry.name for fid, entry in target_files.items()):
+            raise CloudError("目标番号目录包含其他文件，已跳过归档")
+        remaining = [fid for fid in expected if fid not in target_files]
+        for fid in remaining:
+            entry = source_files.get(fid)
+            if not entry or entry.is_dir or entry.name != expected[fid]:
+                raise CloudError("待归档文件已移动或改名，请检查原目录")
+        for name in self._output_names(plan):
+            path = self.root / number / name
+            self.registry.check_output(path, account, job)
+            if not path.is_file():
+                raise CloudError("本地产物不完整，已暂停归档")
+        target = self.client.info(destination)
+        if not target.is_dir or target.name != number or target.parent_id != parent:
+            raise CloudError("目标番号目录身份已变化，已跳过归档")
+        self._stopped()
+        if remaining:
+            self.registry.check_identity()
+            self.client.move(remaining, destination)
+            target_files = {entry.id: entry for entry in self.client.listdir(destination)}
+        if (set(target_files) != set(expected)
+                or any(entry.is_dir or entry.name != expected[fid] for fid, entry in target_files.items())):
+            raise CloudError("归档未完成，下次运行将核对并继续")
+        self.registry.finish_archive(account, job, target_job, plan, target_files)
+        self._info(f"[{number}] 网盘归档完成，已移动至同名子目录")
+        return destination
+
+    def _check_movie_folder(self, cid, parent, original_name, number):
+        siblings = self.client.listdir(parent)
+        folder = next((entry for entry in siblings if entry.id == cid), None)
+        if not folder or not folder.is_dir or folder.name not in (original_name, number):
+            raise CloudError("影片目录位置或名称已变化，已跳过目录改名")
+        if any(entry.id != cid and entry.name.casefold() == number.casefold() for entry in siblings):
+            raise CloudError("同级已存在同名番号目录或文件，已跳过目录改名")
+        return folder
+
+    def _rename_movie_folder(self, cid, parent, original_name, number):
+        plan, complete = self.registry.job(self.client.account, f"{cid}:{number}")
+        if not complete:
+            raise CloudError("本地刮削尚未完成，已跳过目录改名")
+        expected = {item["entry"]["id"]: item["target"] for item in plan["files"]}
+        current = {entry.id: entry for entry in self.client.listdir(cid)}
+        if (any(entry.is_dir or (Path(entry.name).suffix.lower() in VIDEO_EXTS and fid not in expected)
+                for fid, entry in current.items())
+                or any(fid not in current or current[fid].name != name for fid, name in expected.items())):
+            raise CloudError("影片目录内容已变化，已跳过目录改名")
+        folder = self._check_movie_folder(cid, parent, original_name, number)
+        if folder.name == number:
+            return
+        self._stopped()
+        self.registry.check_identity()
+        self.client.rename(cid, number)
+        verified = self.client.info(cid)
+        if not verified.is_dir or verified.name != number or verified.parent_id != parent:
+            raise CloudError("网盘目录改名结果无法确认，下次执行将重新核验")
+        self._info(f"[{number}] 网盘目录已改名：{original_name!r} → {number!r}")
+
     def run(self, roots, recursive=False, limit=30, max_depth=3):
         stats = dict(total=0, ok=0, skip=0, nomatch=0, notfound=0, fail=0, errors=[])
         try:
@@ -527,31 +657,81 @@ class DirectService(PlaybackService):
         for root in roots:
             cid = self.client.resolve_folder(root)
             folder_name = self.client.info(cid).name if cid != "0" else ""
-            queue.append((cid, 0, folder_name))
+            queue.append((cid, 0, folder_name, None))
         visited = set()
+        pending = self.registry.pending_archives(self.client.account)
+        blocked_dirs = set(pending.values())
+        directory_path = getattr(self.client, "directory_path", lambda cid: None)
         while queue and not self.stop_event.is_set():
-            cid, depth, folder_name = queue.pop(0)
-            if cid in visited:
+            cid, depth, folder_name, parent_id = queue.pop(0)
+            if cid in visited or cid in blocked_dirs:
                 continue
             visited.add(cid)
             entries = self.client.listdir(cid)
+            display = directory_path(cid) or folder_name or "/"
+            if depth == 0:
+                self._info(f"扫描目录已解析：{display!r}")
             groups = {}
+            video_count = 0
             for entry in entries:
                 if entry.is_dir:
                     if depth < (max_depth if recursive else 1):
-                        queue.append((entry.id, depth + 1, entry.name))
+                        queue.append((entry.id, depth + 1, entry.name, cid))
                 elif Path(entry.name).suffix.lower() in VIDEO_EXTS:
-                    number = self.extract_number(entry.name) or self.extract_number(folder_name)
+                    video_count += 1
+                    number = self.extract_number(entry.name)
+                    source = "文件名"
+                    if not number:
+                        number = self.extract_number(folder_name)
+                        source = "目录名" if number else "无"
+                    self._debug(f"番号识别 目录={display!r} 原文件名={entry.name!r} 番号={number or '未识别'} 来源={source}")
                     if number:
                         groups.setdefault(number, []).append(entry)
                     else:
                         stats["nomatch"] += 1
+                else:
+                    self._debug(f"扫描文件 目录={display!r} 原文件名={entry.name!r} 类型=非视频")
+            if depth == 0:
+                for job in pending:
+                    parent, _, number = job.partition(":")
+                    if parent == cid:
+                        groups.setdefault(number, [])
             for number, videos in groups.items():
                 if self.stop_event.is_set() or stats["ok"] + stats["notfound"] + stats["fail"] >= limit:
                     return stats
                 stats["total"] += 1
                 try:
-                    status = self._process(number, videos, entries)
+                    destination = pending.get(f"{cid}:{number}")
+                    archive = self.archive_loose and depth == 0 and folder_name.casefold() != number.casefold()
+                    if destination:
+                        if archive:
+                            self._archive(cid, number, destination)
+                            status = "ok"
+                        else:
+                            self._debug(f"[{number}] 已暂停未完成的网盘归档")
+                            status = "skip"
+                    else:
+                        rename_folder = (
+                            self.archive_loose and parent_id is not None and folder_name != number
+                            and len(groups) == 1 and len(videos) == video_count
+                            and not any(entry.is_dir for entry in entries)
+                        )
+                        if rename_folder:
+                            self._check_movie_folder(cid, parent_id, folder_name, number)
+                        if archive:
+                            destination = self._archive_destination(entries, number)
+                            if destination:
+                                blocked_dirs.add(destination)
+                                if self.client.listdir(destination) or self.registry.job(
+                                        self.client.account, f"{destination}:{number}")[0] is not None:
+                                    raise CloudError("目标番号目录已含文件或刮削记录，已跳过归档")
+                        status = self._process(number, videos, entries, archive)
+                        if archive and status in ("ok", "skip"):
+                            blocked_dirs.add(self._archive(cid, number, destination))
+                            status = "ok"
+                        elif rename_folder and status in ("ok", "skip"):
+                            self._rename_movie_folder(cid, parent_id, folder_name, number)
+                            status = "ok"
                 except (AuthenticationError, RiskError):
                     raise
                 except Stopped:
@@ -561,4 +741,6 @@ class DirectService(PlaybackService):
                     message = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
                     stats["errors"].append(number + "：" + message)
                 stats[status] += 1
+                reason = " 原因=已有完整产物" if status == "skip" and not destination else ""
+                self._debug(f"刮削结果 番号={number} 状态={status}{reason}")
         return stats

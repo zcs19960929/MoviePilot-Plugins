@@ -45,6 +45,29 @@ def configure(plugin, token=TOKEN):
 
 
 class MetaTubeAuthenticationTests(unittest.TestCase):
+    def test_scrape_debug_logs_response_data_without_credentials(self):
+        for version in VERSIONS:
+            with self.subTest(version=version):
+                payload = {"data": [{"title": "IPX-939", "token": "response-secret",
+                                     "thumbnail": "https://cdn.example/a?sign=signed-secret"}],
+                           "message": "configured token " + TOKEN}
+                picture = types.SimpleNamespace(status_code=200, headers={"Content-Type": "image/jpeg"},
+                                                json=Mock(side_effect=AssertionError("stream was parsed")))
+                get = Mock(side_effect=[response(200, payload),
+                                        response(500, {"error": {"message": "missing field"}}), picture])
+                plugin = load_plugin(version, get)
+                configure(plugin)
+                plugin.debug = Mock()
+                self.assertIs(plugin._MetaTubeScraper__mt_get("/v1/movies/search", {"q": "IPX-939"}), payload)
+                self.assertIsNone(plugin._MetaTubeScraper__mt_get("/v1/movies/FANZA/example"))
+                self.assertIs(plugin._MetaTubeScraper__mt_get("/v1/images/primary/FANZA/example", stream=True), picture)
+                picture.json.assert_not_called()
+                logs = "\n".join(call.args[0] for call in plugin.debug.call_args_list)
+                for detail in ("/v1/movies/search", "HTTP 200", "IPX-939", "HTTP 500", "missing field", "image/jpeg"):
+                    self.assertIn(detail, logs)
+                for secret in (TOKEN, "response-secret", "signed-secret"):
+                    self.assertNotIn(secret, logs)
+
     def test_selftest_authenticates_every_provider_with_saved_token(self):
         def authenticated_search(url, **kwargs):
             if kwargs.get("headers", {}).get("Authorization") != f"Bearer {TOKEN}":

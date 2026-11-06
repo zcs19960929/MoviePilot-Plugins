@@ -7,6 +7,7 @@ MetaTube 番号刮削插件（MoviePilot V3）
 - 内置读取/写入限速、单次上限、增量跳过，降低 115 风控风险
 """
 
+import json
 import os
 import re
 import time
@@ -18,6 +19,7 @@ import xml.etree.ElementTree as ET
 from copy import copy
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from itertools import islice
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -103,6 +105,51 @@ NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DV", "
     "AV1", "IMAX", "EXT", "FIN", "LEAK", "UNCUT", "CENSORED", "UNCENSORED",
     "NEW", "HQ", "GB", "MB", "TB", "ENG", "RAW", "CAM",
 }
+
+_PRIVATE_LOG_FIELD = re.compile(r"authorization|cookie|token|apikey|password|secret|signature|pickcode|credential")
+_PRIVATE_LOG_TEXT = re.compile(
+    r"\bbearer\s+|\b(?:authorization|cookie|token|api[_-]?key|password|signature|pick[_-]?code|"
+    r"uid|cid|seid|kid)\s*[\"']?\s*[:=]",
+    re.IGNORECASE,
+)
+
+
+def _debug_json(value, token: str = "") -> str:
+    """Bound metadata diagnostics and mask credentials before serialization."""
+    def safe_text(text):
+        if token:
+            text = text.replace(token, "[已隐藏]")
+        if _PRIVATE_LOG_TEXT.search(text):
+            return "[含凭据的文本已隐藏]"
+        text = re.sub(r"https?://[^\s\"'<>]+", "[链接已隐藏]", text, flags=re.IGNORECASE)
+        return text if len(text) <= 600 else text[:600] + "…"
+
+    def clean(item, depth=0):
+        if isinstance(item, str):
+            return safe_text(item)
+        if item is None or isinstance(item, (bool, int, float)):
+            return item
+        if depth >= 5:
+            return "…"
+        if isinstance(item, dict):
+            fields = {}
+            for key, child in islice(item.items(), 20):
+                normalized = re.sub(r"[^a-z0-9]", "", str(key).lower())
+                fields[safe_text(str(key))] = (
+                    "[已隐藏]" if _PRIVATE_LOG_FIELD.search(normalized) else clean(child, depth + 1)
+                )
+            if len(item) > 20:
+                fields["其余字段数"] = len(item) - 20
+            return fields
+        if isinstance(item, list):
+            rows = [clean(child, depth + 1) for child in item[:20]]
+            if len(item) > 20:
+                rows.append(f"其余 {len(item) - 20} 项")
+            return rows
+        return f"<{type(item).__name__}>"
+
+    text = json.dumps(clean(value), ensure_ascii=False)
+    return text if len(text) <= 4000 else text[:4000] + "…（已截断）"
 
 # ---- 表单目录浏览器的事件脚本（MoviePilot V3 FormRender 支持 on* 事件字符串）----
 JS_SCAN_VALUES = "(Array.isArray(scan_dirs) ? scan_dirs : String(scan_dirs || '').split(/[\\n,;]+/)).map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean)"
@@ -323,7 +370,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.7"
+    plugin_version = "1.1.8"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -354,6 +401,7 @@ class MetaTubeScraper(_PluginBase):
     _providers = ""
     _storage = "local"
     _scan_dirs: List[str] = []
+    _dir_labels: Dict[str, str] = {}
     _scan_mode = "subdir"
     _file_interval = 3
     _movie_limit = 30
@@ -363,6 +411,7 @@ class MetaTubeScraper(_PluginBase):
     _download_previews = False
     _preview_limit = 10
     _rename_files = False
+    _archive_loose = False
     _numeric_ids = False
     # v1.2 输出位置与归位
     _write_local = True
@@ -385,7 +434,7 @@ class MetaTubeScraper(_PluginBase):
             candidate.__read_config(config)
             changes = {key: value for key, value in vars(candidate).items()
                        if key not in before or (before[key] is not value and before[key] != value)}
-            execution_changes = changes.keys() - {"_schedule", "_schedule_error"}
+            execution_changes = changes.keys() - {"_schedule", "_schedule_error", "_dir_labels"}
             if not self._config_loaded or execution_changes or self._stop_event.is_set():
                 if self._running:
                     self._stop_event.set()
@@ -433,6 +482,10 @@ class MetaTubeScraper(_PluginBase):
         if isinstance(dirs, list):
             dirs = "\n".join(_pick_str(d) for d in dirs)
         self._scan_dirs = [d.strip() for d in re.split(r"[,;\n\r]+", str(dirs)) if d.strip()]
+        labels = config.get("dir_labels")
+        self._dir_labels = {
+            key: value for key, value in labels.items() if isinstance(value, str) and value.startswith("/")
+        } if isinstance(labels, dict) else {}
         self._scan_mode = config.get("scan_mode") or "subdir"
         for key, default, attr in (
             ("file_interval", 3, "_file_interval"),
@@ -456,6 +509,7 @@ class MetaTubeScraper(_PluginBase):
         self._force = bool(config.get("force_overwrite"))
         self._download_previews = bool(config.get("download_previews"))
         self._rename_files = bool(config.get("rename_files"))
+        self._archive_loose = self._storage == "115_direct" and config.get("archive_loose") is True
         self._numeric_ids = bool(config.get("numeric_ids"))
         self._write_local = bool(config.get("write_local", True))
         self._write_remote = bool(config.get("write_remote"))
@@ -519,7 +573,7 @@ class MetaTubeScraper(_PluginBase):
     def __get_cloud115(self):
         with self._direct_lock:
             if self._cloud115 is None:
-                self._cloud115 = Cloud115(self._cookie115, self._cloud_interval, self._stop_event)
+                self._cloud115 = Cloud115(self._cookie115, self._cloud_interval, self._stop_event, debug=self.debug)
             return self._cloud115
 
     def __get_direct_service(self):
@@ -553,6 +607,8 @@ class MetaTubeScraper(_PluginBase):
                     metadata=metadata, artwork=artwork, build_nfo=backend.__build_nfo,
                     extract_number=lambda text: backend.__extract_number(text, backend._numeric_ids),
                     stop_event=self._stop_event, force=self._force, plugin_id=self.__class__.__name__,
+                    debug=backend.debug, info=backend.info,
+                    archive_loose=self._archive_loose,
                 )
             return self._direct_service
 
@@ -618,20 +674,38 @@ class MetaTubeScraper(_PluginBase):
                  stream: bool = False, timeout: int = 20):
         url = f"{self._url.rstrip('/')}{path}"
         headers = self.__mt_headers()
+        request_log = _debug_json({"接口": path, "参数": params or {}}, self._token)
         for attempt in range(2):
             try:
                 resp = requests.get(url, params=params, headers=headers,
                                     timeout=timeout, stream=stream)
-                if resp.status_code == 200:
-                    return resp if stream else resp.json()
-                self._last_status = resp.status_code
-                self.debug(f"MetaTube 响应异常 {resp.status_code}: {url}")
+                status = resp.status_code
+                if stream:
+                    response_headers = getattr(resp, "headers", {}) or {}
+                    payload = {
+                        "类型": response_headers.get("Content-Type", ""),
+                        "长度": response_headers.get("Content-Length", ""),
+                    }
+                else:
+                    try:
+                        payload = resp.json()
+                    except ValueError:
+                        self.debug(f"MetaTube GET {request_log} HTTP {status} 响应为非 JSON")
+                        if status == 200:
+                            raise
+                        self._last_status = status
+                        return None
+                self.debug(f"MetaTube GET {request_log} HTTP {status} 数据={_debug_json(payload, self._token)}")
+                if status == 200:
+                    return resp if stream else payload
+                self._last_status = status
                 return None
             except Exception as e:
+                self.debug(f"MetaTube GET {request_log} 第 {attempt + 1} 次请求异常={type(e).__name__}")
                 if attempt == 0:
                     time.sleep(1)
                 else:
-                    self.error(f"请求 MetaTube 失败: {url} - {e}")
+                    self.error(f"请求 MetaTube 失败 {request_log} 异常={type(e).__name__}")
                     return None
 
     def __search_movie(self, number: str) -> Tuple[Optional[dict], Optional[str]]:
@@ -830,6 +904,7 @@ class MetaTubeScraper(_PluginBase):
                     "path": str(Path(path) / name),
                     "type": "dir" if f.type == "dir" else "file",
                 })
+            self.debug(f"StorageChain list_files 目录={path!r} 返回条目数={len(out)}")
             return out
         except Exception as e:
             self.error(f"读取网盘目录失败 {path}: {e}")
@@ -1040,8 +1115,12 @@ class MetaTubeScraper(_PluginBase):
             children = self.list_children(dir_path)
             if not children:
                 return "skip"
+            for child in children:
+                if child["type"] == "file":
+                    self.debug(f"扫描文件 目录={dir_path!r} 原文件名={child['name']!r}")
             names = {c["name"].lower() for c in children}
             if "movie.nfo" in names and not self._force:
+                self.debug(f"刮削结果 目录={dir_path!r} 状态=跳过 原因=已有 movie.nfo")
                 return "skip"
             videos = [c for c in children if c["type"] == "file"
                       and Path(c["name"]).suffix.lower() in VIDEO_EXTS]
@@ -1049,10 +1128,13 @@ class MetaTubeScraper(_PluginBase):
                 return "skip"
 
             video_name = videos[0]["name"]
-            number = (self.__extract_number(video_name, self._numeric_ids)
-                      or self.__extract_number(Path(dir_path).name, self._numeric_ids))
+            number = self.__extract_number(video_name, self._numeric_ids)
+            source = "文件名"
             if not number:
-                self.debug(f"未识别到番号: {dir_path} / {video_name}")
+                number = self.__extract_number(Path(dir_path).name, self._numeric_ids)
+                source = "目录名" if number else "无"
+            self.debug(f"番号识别 目录={dir_path!r} 原文件名={video_name!r} 番号={number or '未识别'} 来源={source}")
+            if not number:
                 return "nomatch"
 
             result, provider = self.__search_movie(number)
@@ -1158,6 +1240,20 @@ class MetaTubeScraper(_PluginBase):
             return "fail"
     # ---------------- 任务 ----------------
 
+    def __scan_log_dirs(self):
+        if self._storage != "115_direct":
+            return self._scan_dirs
+        directories = []
+        cached_path = getattr(self._cloud115, "directory_path", lambda cid: None)
+        for directory in self._scan_dirs:
+            if directory.startswith("/"):
+                directories.append(directory)
+                continue
+            cid = directory[3:] if directory.startswith("id:") else directory
+            label = cached_path(cid) or self._dir_labels.get(f"id:{cid}")
+            directories.append("/" if cid == "0" else label or "待解析")
+        return directories
+
     def __scrape_all(self):
         with self._direct_lock, self._lock:
             if self._running:
@@ -1169,7 +1265,7 @@ class MetaTubeScraper(_PluginBase):
             stats = {"total": 0, "ok": 0, "skip": 0, "nomatch": 0,
                      "notfound": 0, "fail": 0, "time": "", "storage": self._storage}
         try:
-            self.info(f"MetaTube 番号刮削开始，存储: {self._storage}，目录: {self._scan_dirs}")
+            self.info(f"MetaTube 番号刮削开始，存储: {self._storage}，目录: {self.__scan_log_dirs()}")
             if stats["storage"] == "115_direct":
                 with self._direct_lock:
                     if task_stop_event.is_set() or self._stop_event is not task_stop_event:
@@ -1476,7 +1572,7 @@ class MetaTubeScraper(_PluginBase):
                     {"title": "其他存储（可手填存储名）", "value": "alist"},
                 ],
             }}, md=12)),
-            alert("直连模式会在原目录规范视频和关联字幕名称，不移动目录；独立生成 STRM、字幕、NFO 和图片。", direct),
+            alert("直连模式会规范视频和关联字幕名称，并生成本地 STRM、字幕、NFO 和图片。可按番号整理网盘目录。", direct),
             alert("本地模式在影片原目录生成 NFO 和图片，不生成 STRM。", local),
             alert("115Lite 兼容模式不支持元数据上传和本插件的自动归位；可写本地 NFO/图片，并通知 115Lite 生成 STRM。", lite),
             alert("通过 MoviePilot 存储接口读写；上传、移动是否可用取决于所选存储。", writable),
@@ -1489,7 +1585,7 @@ class MetaTubeScraper(_PluginBase):
                 text("playback_base_url", "MoviePilot 播放入口地址", "https://mp.example.com",
                      "填写 Emby/播放器可访问的 MoviePilot 地址；播放时由本插件 302 跳转到 115", show=direct),
                 text("cloud_interval", "115 后台请求间隔（秒）", "5",
-                     "串行读取、改名和字幕取链的请求间隔；不保证固定间隔绝对安全", show=direct),
+                     "串行读取、改名、归档和字幕取链的请求间隔", show=direct),
             ),
             row(col({"component": "VCombobox", "props": {
                 "model": "scan_dirs", "label": "扫描目录（可多选）",
@@ -1506,6 +1602,9 @@ class MetaTubeScraper(_PluginBase):
                     "persistent-hint": True,
                 }}, md=9, show=legacy),
                 button("选择目录", JS_PICK_OPEN, icon="mdi-folder-open-outline", md=3, size="default")),
+            row(switch("archive_loose", "网盘目录和文件按番号整理",
+                       "散装视频和关联字幕移入番号目录，已有的单番号影片子目录也按番号改名。",
+                       show=direct)),
             {"component": "VDialog", "props": {
                 "model": "dir_picker_open", "maxWidth": 800, "width": "calc(100% - 32px)",
                 "scrollable": True, "aria-label": "选择扫描目录", "onUpdate:modelValue": JS_PICK_TOGGLE,
@@ -1613,6 +1712,7 @@ class MetaTubeScraper(_PluginBase):
             "enabled": False, "metatube_url": "", "metatube_token": "",
             "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub", "storage": "115_direct",
             "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
+            "archive_loose": False,
             "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,
