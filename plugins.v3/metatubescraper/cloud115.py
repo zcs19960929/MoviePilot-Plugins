@@ -265,7 +265,7 @@ class Cloud115:
         self._call("fs_rename", (str(fid), name))
 
     def mkdir(self, name, parent_id):
-        if not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", name):
+        if name != "数字番号" and not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", name):
             raise CloudError("归档目录名称无效")
         result = self._call("fs_mkdir", {"cname": name, "pid": str(parent_id)})
         cid = str(result.get("cid") or result.get("file_id") or "")

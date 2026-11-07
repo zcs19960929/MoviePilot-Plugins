@@ -25,7 +25,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
-from .direct import DirectService, PlaybackService, UnknownMedia
+from .direct import PlaybackService, UnknownMedia
+from .library import LibraryService
 from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError, Stopped
 from .schedule import build_schedule
 
@@ -370,7 +371,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.1.9"
+    plugin_version = "1.2.0"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -601,7 +602,7 @@ class MetaTubeScraper(_PluginBase):
                     return backend.__download_image_bytes(
                         f"/v1/images/{endpoint}/{info.get('provider', '')}/{info.get('id', '')}")
 
-                self._direct_service = DirectService(
+                self._direct_service = LibraryService(
                     client=client, data_dir=Path(self.get_data_path()) / "115_direct",
                     output_root=self._local_strm_root, playback_base_url=self._playback_base_url,
                     metadata=metadata, artwork=artwork, build_nfo=backend.__build_nfo,
@@ -1607,8 +1608,9 @@ class MetaTubeScraper(_PluginBase):
                 }}, md=9, show=legacy),
                 button("选择目录", JS_PICK_OPEN, icon="mdi-folder-open-outline", md=3, size="default")),
             row(switch("archive_loose", "网盘目录和文件按番号整理",
-                       "散装视频和关联字幕移入番号目录，已有的单番号影片子目录也按番号改名。",
+                       "视频和关联字幕归入前缀／番号目录；已有单番号影片目录也按该层级整理。",
                        show=direct)),
+            alert("按番号前缀／番号生成本地媒体库；同番号多个版本共用 NFO 和图片，字幕、分段跟随对应版本。", direct),
             {"component": "VDialog", "props": {
                 "model": "dir_picker_open", "maxWidth": 800, "width": "calc(100% - 32px)",
                 "scrollable": True, "aria-label": "选择扫描目录", "onUpdate:modelValue": JS_PICK_TOGGLE,
@@ -1655,7 +1657,7 @@ class MetaTubeScraper(_PluginBase):
             ]}]},
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2", "show": expr(f"!{local}")}, "content": [
                 {"component": "VCardText", "content": [
-                    alert("输出到本地根目录/番号；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
+                    alert("固定按番号前缀／番号生成本地媒体库；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
                     row(switch("write_local", "在本地生成 NFO 和图片", "这里只写元数据，不生成 STRM", show=remote),
                         switch("write_remote", "向网盘写入 NFO 和图片", "需要所选存储支持上传", show=writable)),
                     alert("尚未选择有效输出；115Lite 模式需要启用本地元数据输出。",
@@ -1663,7 +1665,7 @@ class MetaTubeScraper(_PluginBase):
                     row(text("remote_lib_root", "网盘媒体库根目录", "/jav",
                              "用于本地路径映射或自动归位；未开启归位时，影片须已位于此目录内", show=f"{mapped} || {moving}"),
                         text("local_strm_root", "本地媒体库根目录", "/media/strm/jav",
-                             expr(f"{direct} ? '容器内可写路径，按番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
+                             expr(f"{direct} ? '容器内可写的绝对路径，按番号前缀／番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
                     row(switch("organize", "自动归位到网盘媒体库", "需要存储支持移动；仅移动视频，外挂字幕不会跟随", show=writable),
                         switch("trigger_strm", "刮完通知 115Lite 生成 STRM",
                                "仅适用于同一 115 网盘目录；需启用 115Lite 并配置本地目录与网盘目录映射",
@@ -1673,7 +1675,7 @@ class MetaTubeScraper(_PluginBase):
             row(col({"component": "VSelect", "props": {
                     "model": "scan_mode", "label": "扫描模式",
                     "items": expr(f"[{{title: {direct} ? '扫描根目录及一级子目录' : '仅扫描一级影片子目录', value: 'subdir'}}, {{title: '递归扫描', value: 'recursive'}}]"),
-                    "hint": expr(f"{direct} ? '包含根目录散装视频；递归最多 3 层，请求较多' : ({local} ? '递归遇到影片目录后停止继续深入' : '递归最多 3 层，请求较多')"),
+                    "hint": expr(f"{direct} ? '包含根目录散装视频；分类目录不占影片扫描深度，递归最多 3 层' : ({local} ? '递归遇到影片目录后停止继续深入' : '递归最多 3 层，请求较多')"),
                     "persistent-hint": True,
                 }}),
                 text("file_interval", "兼容模式读写间隔（秒）", "3", "受控读写前的等待时间，不是风控安全保证", show=legacy)),

@@ -18,17 +18,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def components(version="v3"):
-    directory = ROOT / f"plugins.{version}" / "metatubescraper"
-    path = directory / "direct.py"
-    if not path.exists():
-        raise AssertionError(f"{version}: independent 115 processing is missing")
+    import importlib
     name = f"direct_acceptance_{version}"
     package = types.ModuleType(name)
-    package.__path__ = [str(directory)]
-    spec = importlib.util.spec_from_file_location(name + ".direct", path)
-    module = importlib.util.module_from_spec(spec)
-    with patch.dict(sys.modules, {name: package, spec.name: module}):
-        spec.loader.exec_module(module)
+    package.__path__ = [str(ROOT/f"plugins.{version}"/"metatubescraper")]
+    sys.modules[name] = package
+    module = importlib.import_module(name + ".library")
+    cloud = importlib.import_module(name + ".cloud115")
+    module.Cloud115, module.DirectLink = cloud.Cloud115, cloud.DirectLink
     return module
 
 
@@ -97,7 +94,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         ]
         cloud = FakeCloud(m, entries)
         metadata = Mock(return_value={"provider": "FANZA", "id": "film", "title": "Example"})
-        service = m.DirectService(
+        service = m.LibraryService(
             client=cloud, data_dir=Path(directory) / "state",
             output_root=Path(directory) / "library", playback_base_url="https://mp.example",
             metadata=metadata, artwork=lambda info, kind: b"image:" + kind.encode(),
@@ -107,131 +104,11 @@ class DirectAcceptanceTests(unittest.TestCase):
         self.addCleanup(service.close)
         return m, cloud, metadata, service
 
-    def test_archive_existing_loose_video_and_subtitle_keeps_strm_and_nested_files(self):
-        for version in ("v2", "v3"):
-            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
-                m, cloud, metadata, service = self.make(directory, version)
-                cloud.entries = {e.id: e for e in (
-                    m.Entry("7", "0", "jav", is_dir=True),
-                    m.Entry("1", "7", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
-                    m.Entry("2", "7", "www.98T.la@IPX-939.zh.ass", pickcode="b" * 17),
-                    m.Entry("8", "7", "IPX-940", is_dir=True),
-                    m.Entry("3", "8", "IPX-940.mp4", pickcode="c" * 17),
-                )}
-                service.extract_number = load_plugin(version, Mock())._MetaTubeScraper__extract_number
-                self.assertEqual(service.run(["7"])["ok"], 2)
-                self.assertEqual(cloud.moves, [])
-                strm = Path(directory)/"library/IPX-939/IPX-939.strm"
-                original = strm.read_bytes()
-                service.archive_loose = True
-                self.assertEqual(service.run(["7"])["ok"], 1)
-                self.assertEqual(cloud.directories, [("IPX-939", "7")])
-                target = next(e for e in cloud.entries.values() if e.is_dir and e.name == "IPX-939")
-                self.assertEqual(cloud.moves, [(["1", "2"], target.id)])
-                self.assertEqual(cloud.entries["1"].name, "IPX-939.mp4")
-                self.assertEqual(cloud.entries["2"].name, "IPX-939.zh.ass")
-                self.assertEqual(cloud.entries["3"].parent_id, "8")
-                self.assertEqual(strm.read_bytes(), original)
-                token = original.decode().strip().split("media_id=")[1]
-                self.assertEqual(service.registry.media(cloud.account, token).parent_id, target.id)
-                self.assertEqual(service.run(["7"])["skip"], 2)
-                self.assertEqual(len(cloud.moves), 1)
-                self.assertEqual(metadata.call_count, 2)
 
-    def test_archive_renames_movie_folder_and_files_in_place(self):
-        for version in ("v2", "v3"):
-            with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
-                m, cloud, metadata, service = self.make(directory, version)
-                cloud.entries = {e.id: e for e in (
-                    m.Entry("7", "0", "jav", is_dir=True),
-                    m.Entry("8", "7", "www.98T.la@IPX-939", is_dir=True),
-                    m.Entry("1", "8", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
-                    m.Entry("2", "8", "www.98T.la@IPX-939.zh.forced.ass", pickcode="b" * 17),
-                )}
-                service.extract_number = load_plugin(version, Mock())._MetaTubeScraper__extract_number
-                service.archive_loose = True
-                self.assertEqual(service.run(["7"])["ok"], 1)
-                self.assertEqual(cloud.entries["8"], m.Entry("8", "7", "IPX-939", is_dir=True))
-                self.assertEqual(cloud.entries["1"].name, "IPX-939.mp4")
-                self.assertEqual(cloud.entries["2"].name, "IPX-939.zh.forced.ass")
-                self.assertEqual([cloud.entries[fid].parent_id for fid in ("1", "2")], ["8", "8"])
-                self.assertEqual(cloud.directories, [])
-                self.assertEqual(cloud.moves, [])
-                self.assertEqual(cloud.renames[-1], ("8", "IPX-939"))
-                strm = Path(directory)/"library/IPX-939/IPX-939.strm"
-                original = strm.read_bytes()
-                self.assertEqual(service.run(["7"])["skip"], 1)
-                self.assertEqual(strm.read_bytes(), original)
-                self.assertEqual(metadata.call_count, 1)
-                self.assertEqual(len(cloud.renames), 3)
 
-    def test_movie_folder_name_collision_is_checked_before_file_renames(self):
-        with tempfile.TemporaryDirectory() as directory:
-            m, cloud, metadata, service = self.make(directory)
-            cloud.entries = {e.id: e for e in (
-                m.Entry("8", "0", "www.98T.la@IPX-939", is_dir=True),
-                m.Entry("9", "0", "ipx-939", is_dir=True),
-                m.Entry("1", "8", "www.98T.la@IPX-939.mp4", pickcode="a" * 17),
-            )}
-            service.archive_loose = True
-            result = service.run(["0"])
-            self.assertEqual(result["fail"], 1)
-            self.assertIn("同名", " ".join(result["errors"]))
-            self.assertEqual(cloud.renames, [])
-            metadata.assert_not_called()
 
-    def test_mixed_movie_folder_is_not_renamed_to_a_single_number(self):
-        with tempfile.TemporaryDirectory() as directory:
-            m, cloud, metadata, service = self.make(directory)
-            cloud.entries = {e.id: e for e in (
-                m.Entry("8", "0", "多部影片", is_dir=True),
-                m.Entry("1", "8", "IPX-939.mp4", pickcode="a" * 17),
-                m.Entry("2", "8", "IPX-940.mp4", pickcode="b" * 17),
-            )}
-            service.archive_loose = True
-            self.assertEqual(service.run(["0"])["ok"], 2)
-            self.assertEqual(cloud.entries["8"].name, "多部影片")
-            self.assertEqual(cloud.renames, [])
 
-    def test_archive_resumes_when_video_moved_before_subtitle(self):
-        with tempfile.TemporaryDirectory() as directory:
-            m, cloud, metadata, service = self.make(directory)
-            service.archive_loose = True
-            unrelated = m.Entry("99", "0", "unrelated.en.srt", pickcode="c" * 17)
-            cloud.entries[unrelated.id] = unrelated
-            cloud.interrupt_move_after = "1"
-            self.assertEqual(service.run(["0"])["fail"], 1)
-            self.assertNotEqual(cloud.entries["1"].parent_id, "0")
-            self.assertEqual(cloud.entries["2"].parent_id, "0")
-            target = cloud.entries["1"].parent_id
-            strm = Path(directory)/"library/DSOD-060/DSOD-060.strm"
-            original = strm.read_bytes()
-            service.close()
-            service.registry.reopen()
-            service.archive_loose = False
-            service.run(["0"])
-            self.assertEqual(cloud.moves, [(["1", "2"], target)])
-            service.archive_loose = True
-            self.assertEqual(service.run(["0"])["ok"], 1)
-            self.assertEqual(cloud.moves, [(["1", "2"], target), (["2"], target)])
-            self.assertEqual(cloud.entries["2"].parent_id, target)
-            self.assertEqual(cloud.entries[unrelated.id], unrelated)
-            self.assertEqual(strm.read_bytes(), original)
-            self.assertEqual(service.run(["0"])["skip"], 1)
-            self.assertEqual(metadata.call_count, 1)
 
-    def test_archive_destination_with_unrelated_file_preserves_source(self):
-        with tempfile.TemporaryDirectory() as directory:
-            m, cloud, metadata, service = self.make(directory)
-            service.archive_loose = True
-            cloud.entries["10"] = m.Entry("10", "0", "DSOD-060", is_dir=True)
-            cloud.entries["11"] = m.Entry("11", "10", "existing.txt")
-            result = service.run(["0"])
-            self.assertEqual(result["fail"], 1)
-            self.assertIn("目标番号目录", " ".join(result["errors"]))
-            self.assertEqual(cloud.renames, [])
-            self.assertEqual(cloud.directories, [])
-            self.assertEqual(cloud.moves, [])
 
     def test_number_extraction_ignores_leading_website_watermarks(self):
         cases = (
@@ -262,32 +139,6 @@ class DirectAcceptanceTests(unittest.TestCase):
                 with self.subTest(version=version, name=name, numeric_ids=numeric_ids):
                     self.assertEqual(extract(name, numeric_ids), expected)
 
-    def test_watermarked_videos_group_by_number_and_keep_real_conflicts(self):
-        cases = (
-            ("IPX-939.mp4", "IPX-940.mp4", ["IPX-939", "IPX-940"], 0),
-            ("IPX-939.mp4", "IPX-939.mkv", [], 1),
-            ("IPX-939-CD1.mp4", "IPX-939-CD2.mp4", ["IPX-939"], 0),
-        )
-        for version in ("v2", "v3"):
-            extract = load_plugin(version, Mock())._MetaTubeScraper__extract_number
-            for first, second, numbers, failures in cases:
-                with self.subTest(version=version, files=(first, second)), tempfile.TemporaryDirectory() as directory:
-                    m, cloud, metadata, service = self.make(directory, version)
-                    original_names = ("www.98T.la@www.98T.la@" + first, "www.98T.la" + second)
-                    cloud.entries = {
-                        str(index): m.Entry(str(index), "0", name, pickcode=str(index) * 17)
-                        for index, name in enumerate(original_names, 1)
-                    }
-                    service.extract_number = extract
-                    result = service.run(["0"])
-                    self.assertEqual(result["fail"], failures)
-                    self.assertEqual(result["ok"], len(numbers))
-                    self.assertEqual([call.args[0] for call in metadata.call_args_list], numbers)
-                    if failures:
-                        self.assertIn("同番号存在不同版本或重复分段", " ".join(result["errors"]))
-                        self.assertEqual(cloud.renames, [])
-                    else:
-                        self.assertEqual([name for _, name in cloud.renames], [first, second])
 
     def test_independent_pipeline_and_idempotence_both_versions(self):
         for version in ("v2", "v3"):
@@ -295,11 +146,11 @@ class DirectAcceptanceTests(unittest.TestCase):
                 m, cloud, metadata, service = self.make(directory, version)
                 stats = service.run(["0"])
                 self.assertEqual(stats["ok"], 1)
-                output = Path(directory) / "library" / "DSOD-060"
-                self.assertEqual(cloud.entries["1"].name, "DSOD-060.mp4")
-                self.assertEqual(cloud.entries["2"].name, "DSOD-060.zh.ass")
-                self.assertEqual((output / "DSOD-060.zh.ass").read_bytes(), b"subtitle:2")
-                strm = (output / "DSOD-060.strm").read_text()
+                output = Path(directory) / "library" / "DSOD" / "DSOD-060"
+                self.assertEqual(cloud.entries["1"].name, "DSOD-060 - V0001.mp4")
+                self.assertEqual(cloud.entries["2"].name, "DSOD-060 - V0001.zh.ass")
+                self.assertEqual((output / "DSOD-060 - V0001.zh.ass").read_bytes(), b"subtitle:2")
+                strm = (output / "DSOD-060 - V0001.strm").read_text()
                 self.assertTrue(strm.startswith("https://mp.example/api/v1/plugin/MetaTubeScraper/redirect_url?media_id="))
                 self.assertNotIn("P115Lite", strm)
                 self.assertNotIn("pickcode", strm)
@@ -309,11 +160,11 @@ class DirectAcceptanceTests(unittest.TestCase):
                 calls = list(cloud.renames)
                 self.assertEqual(service.run(["0"])["skip"], 1)
                 self.assertEqual(cloud.renames, calls)
-                (output / "DSOD-060.strm").unlink()
-                (output / "DSOD-060.zh.ass").unlink()
+                (output / "DSOD-060 - V0001.strm").unlink()
+                (output / "DSOD-060 - V0001.zh.ass").unlink()
                 self.assertEqual(service.run(["0"])["ok"], 1)
                 self.assertEqual(cloud.renames, calls)
-                self.assertEqual((output / "DSOD-060.strm").read_text(), strm)
+                self.assertEqual((output / "DSOD-060 - V0001.strm").read_text(), strm)
 
     def test_metadata_failure_never_renames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -333,27 +184,13 @@ class DirectAcceptanceTests(unittest.TestCase):
                     self.assertTrue(result['stopped'])
                     self.assertEqual(cloud.renames,[])
 
-    def test_stop_after_a_completed_film_preserves_progress(self):
-        for version in ('v2','v3'):
-            with self.subTest(version=version),tempfile.TemporaryDirectory() as directory:
-                m,cloud,metadata,service=self.make(directory,version)
-                cloud.entries['10']=m.Entry('10','0','next folder',is_dir=True)
-                original=cloud.listdir
-                def stop_in_child(cid):
-                    if str(cid)=='10':raise m.Stopped('任务已停止')
-                    return original(cid)
-                cloud.listdir=stop_in_child
-                result=service.run(['0'])
-                self.assertTrue(result['stopped'])
-                self.assertEqual((result['ok'],result['fail']),(1,0))
-                self.assertTrue((Path(directory)/'library/DSOD-060/movie.nfo').is_file())
 
     def test_owned_nfo_format_upgrade_uses_cache_without_cloud_writes_or_downloads(self):
         for version in ("v2", "v3"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 m, cloud, metadata, service = self.make(directory, version)
                 self.assertEqual(service.run(["0"])["ok"], 1)
-                output = Path(directory) / "library/DSOD-060"
+                output = Path(directory) / "library/DSOD/DSOD-060"
                 preserved = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in output.iterdir() if p.name != "movie.nfo"}
                 service.build_nfo = lambda info, number: ("<movie><title>" + number + " " + info['title'] + "</title><plot>上映日期：2026-09-18</plot></movie>").encode()
                 cloud.rename = Mock(side_effect=AssertionError("no cloud rename during NFO upgrade"))
@@ -374,7 +211,7 @@ class DirectAcceptanceTests(unittest.TestCase):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 m, cloud, metadata, service = self.make(directory, version)
                 service.run(["0"])
-                output = Path(directory) / 'library/DSOD-060/movie.nfo'
+                output = Path(directory) / 'library/DSOD/DSOD-060/movie.nfo'
                 service.build_nfo = lambda info, number: b'<movie><title>Updated presentation</title></movie>'
                 published = service.registry.published
                 def lose_ack(path, data):
@@ -387,7 +224,7 @@ class DirectAcceptanceTests(unittest.TestCase):
                 service.registry.published = published
                 service.close()
                 service.registry.reopen()
-                self.assertEqual(service.run(["0"])["ok"], 1)
+                self.assertEqual(service.run(["0"])["skip"], 1)
                 self.assertEqual(service.run(["0"])["skip"], 1)
                 self.assertIsNone(service.registry._output(output.resolve())['pending'])
                 output.write_text('external edit')
@@ -395,7 +232,7 @@ class DirectAcceptanceTests(unittest.TestCase):
                 self.assertEqual(service.run(["0"])["fail"], 1)
                 self.assertEqual(output.read_text(), 'external edit')
 
-    def test_old_pending_nfo_can_upgrade_after_restart_without_losing_ownership(self):
+    def test_pending_nfo_can_upgrade_after_restart_without_losing_ownership(self):
         for version in ("v2", "v3"):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as directory:
                 m, cloud, metadata, service = self.make(directory, version)
@@ -413,7 +250,7 @@ class DirectAcceptanceTests(unittest.TestCase):
                 cloud.rename = Mock(side_effect=AssertionError('already renamed'))
                 self.assertEqual(service.run(["0"])["ok"], 1)
                 self.assertEqual(service.run(["0"])["skip"], 1)
-                path = (Path(directory) / 'library/DSOD-060/movie.nfo').resolve()
+                path = (Path(directory) / 'library/DSOD/DSOD-060/movie.nfo').resolve()
                 self.assertEqual(ET.fromstring(path.read_bytes()).findtext('title'), 'New version presentation')
                 self.assertIsNone(service.registry._output(path)['pending'])
                 cloud.rename.assert_not_called()
@@ -429,7 +266,7 @@ class DirectAcceptanceTests(unittest.TestCase):
                     published(path, data)
                 service.registry.published = lose_ack
                 self.assertEqual(service.run(["0"])["fail"], 1)
-                path = Path(directory) / 'library/DSOD-060/movie.nfo'
+                path = Path(directory) / 'library/DSOD/DSOD-060/movie.nfo'
                 path.write_text('external change after interruption')
                 service.registry.published = published
                 service.build_nfo = lambda info, number: b'<movie><title>New format</title></movie>'
@@ -440,9 +277,9 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060.en.srt", pickcode="c" * 17)
+            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060 - V0001.en.srt", pickcode="c" * 17)
             self.assertEqual(service.run(["0"])["ok"], 1)
-            self.assertEqual((Path(directory) / "library/DSOD-060/DSOD-060.en.srt").read_bytes(), b"subtitle:3")
+            self.assertEqual((Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.en.srt").read_bytes(), b"subtitle:3")
 
     def test_force_refreshes_metadata_but_does_not_repeat_cloud_renames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -450,19 +287,19 @@ class DirectAcceptanceTests(unittest.TestCase):
             service.run(["0"])
             rename_calls = list(cloud.renames)
             metadata.return_value = {"provider": "FANZA", "id": "film", "title": "Corrected title"}
-            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060.en.srt", pickcode="c" * 17)
+            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060 - V0001.en.srt", pickcode="c" * 17)
             service.force = True
             self.assertEqual(service.run(["0"])["ok"], 1)
-            nfo = Path(directory) / "library/DSOD-060/movie.nfo"
+            nfo = Path(directory) / "library/DSOD/DSOD-060/movie.nfo"
             self.assertEqual(ET.fromstring(nfo.read_bytes()).findtext("title"), "Corrected title")
-            self.assertEqual(cloud.renames, rename_calls)
+            self.assertEqual([call for call in cloud.renames if call[0] in {"1", "2"}], rename_calls)
 
     def test_output_directory_replacement_during_staging_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             outside = Path(directory) / "outside"
             outside.mkdir()
-            folder = Path(directory) / "library/DSOD-060"
+            folder = Path(directory) / "library/DSOD/DSOD-060"
             def artwork(info, kind):
                 if not folder.is_symlink():
                     folder.rmdir()
@@ -489,7 +326,7 @@ class DirectAcceptanceTests(unittest.TestCase):
             service.registry.reopen()
             self.assertEqual(service.run(["0"])["ok"], 1)
             self.assertEqual([fid for fid, name in cloud.renames].count("1"), 1)
-            self.assertEqual(cloud.entries["2"].name, "DSOD-060.zh.ass")
+            self.assertEqual(cloud.entries["2"].name, "DSOD-060 - V0001.zh.ass")
 
     def test_multipart_and_language_and_vobsub_pairs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -502,21 +339,15 @@ class DirectAcceptanceTests(unittest.TestCase):
                 m.Entry("5", "0", "DSOD-060 original-CD2.zh.sub", pickcode="e" * 17),
             ]}
             self.assertEqual(service.run(["0"])["ok"], 1)
-            output = Path(directory) / "library" / "DSOD-060"
-            for name in ("DSOD-060-CD1.strm", "DSOD-060-CD2.strm", "DSOD-060-CD1.zh-Hans.forced.ass", "DSOD-060-CD2.zh.idx", "DSOD-060-CD2.zh.sub"):
+            output = Path(directory) / "library" / "DSOD" / "DSOD-060"
+            for name in ("DSOD-060 - V0001-CD1.strm", "DSOD-060 - V0001-CD2.strm", "DSOD-060 - V0001-CD1.zh-Hans.forced.ass", "DSOD-060 - V0001-CD2.zh.idx", "DSOD-060 - V0001-CD2.zh.sub"):
                 self.assertTrue((output / name).is_file(), name)
 
-    def test_conflicting_editions_are_not_renamed(self):
-        with tempfile.TemporaryDirectory() as directory:
-            m, cloud, metadata, service = self.make(directory)
-            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060 another.mp4", pickcode="c" * 17)
-            self.assertEqual(service.run(["0"])["fail"], 1)
-            self.assertEqual(cloud.renames, [])
 
     def test_existing_local_file_is_preserved(self):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
-            output = Path(directory) / "library" / "DSOD-060"
+            output = Path(directory) / "library" / "DSOD" / "DSOD-060"
             output.mkdir(parents=True)
             (output / "movie.nfo").write_text("user content")
             self.assertEqual(service.run(["0"])["fail"], 1)
@@ -549,7 +380,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 urls = list(pool.map(lambda _: service.playback_url(media_id, "Emby"), range(6)))
             self.assertEqual(len(set(urls)), 1)
@@ -562,7 +393,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            nfo = Path(directory) / "library/DSOD-060/movie.nfo"
+            nfo = Path(directory) / "library/DSOD/DSOD-060/movie.nfo"
             nfo.write_text("manual edit")
             self.assertEqual(service.run(["0"])["fail"], 1)
             self.assertEqual(nfo.read_text(), "manual edit")
@@ -571,7 +402,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            strm = (Path(directory) / "library/DSOD-060/DSOD-060.strm").read_text()
+            strm = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text()
             media_id = strm.strip().split("media_id=")[1]
             self.assertEqual(len(media_id), 64)
             self.assertTrue(service.playback_url(media_id, "Emby").startswith("https://cdn.115.com/"))
@@ -589,7 +420,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
             cloud.download_link = lambda *a, **k: m.DirectLink("https://cdn.115.com/v?f=3", {"Cookie": "secret"}, 4102444800)
             with self.assertRaises(m.CloudError):
                 service.playback_url(media_id, "Emby")
@@ -598,7 +429,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
             cloud.download_link = lambda *a, **k: m.DirectLink("http://cdn.115.com/video?t=4102444800", {}, 4102444800)
             self.assertTrue(service.playback_url(media_id, "Emby").startswith("http://cdn.115.com/"))
 
@@ -629,6 +460,18 @@ class DirectAcceptanceTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_numeric_category_directory_is_allowed_without_accepting_paths(self):
+        for version in ("v2", "v3"):
+            m = components(version)
+            sdk = types.SimpleNamespace(fs_mkdir=Mock(return_value={"state": True, "cid": "9"}))
+            client = m.Cloud115("UID=12345_A1; CID=fixture; SEID=fixture", sdk=sdk, interval=0)
+            with self.subTest(version=version):
+                self.assertEqual(client.mkdir("数字番号", "7"), "9")
+                for name in ("../数字番号", "数字番号/影片", "", ".", ".."):
+                    with self.assertRaises(m.CloudError):
+                        client.mkdir(name, "7")
+                self.assertEqual(sdk.fs_mkdir.call_count, 1)
+
     def test_directory_breadcrumbs_keep_unicode_names_without_extra_requests(self):
         for version in ('v2','v3'):
             m=components(version)

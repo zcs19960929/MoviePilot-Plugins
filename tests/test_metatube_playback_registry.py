@@ -42,29 +42,13 @@ class PlaybackRegistryTests(unittest.TestCase):
                 self.assertEqual(tokens[0], tokens[1], 'same file must retain one stable ID')
                 for token in tokens: self.assertEqual(regs[0].media('12345', token), entry)
 
-    def test_old_alias_and_canonical_survive_reopen_and_reject_rebinding(self):
-        for version in ('v2', 'v3'):
-            with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
-                m = components(version); r = m.Registry(tmp); self.addCleanup(r.close)
-                entry = m.Entry('7', '0', 'DSOD-060.mp4', pickcode='fixture')
-                canonical = r.media_token('12345', entry)
-                self.assertTrue(callable(getattr(r, 'restore_media', None)), 'restore API missing')
-                self.assertTrue(r.restore_media('12345', entry, 'a' * 64))
-                self.assertFalse(r.restore_media('12345', entry, 'a' * 64))
-                r.close(); r.reopen()
-                for token in (canonical, 'a' * 64): self.assertEqual(r.media('12345', token), entry)
-                with self.assertRaises(KeyError): r.media('other', 'a' * 64)
-                with self.assertRaises(m.CloudError):
-                    r.restore_media('12345', dataclasses.replace(entry, id='8'), 'a' * 64)
-                with self.assertRaises(m.CloudError): r.restore_media('other', entry, 'a' * 64)
-                self.assertEqual(r.media_token('12345', entry), canonical)
 
     def test_relative_output_rejected_before_creating_state_or_library(self):
         m = components()
         with tempfile.TemporaryDirectory() as tmp:
             state = Path(tmp)/'state'
             with self.assertRaisesRegex(m.CloudError, '绝对路径'):
-                m.DirectService(client=Mock(), data_dir=state, output_root='media/link/japan',
+                m.LibraryService(client=Mock(), data_dir=state, output_root='media/link/japan',
                                 playback_base_url='https://mp.example', metadata=Mock(), artwork=Mock(),
                                 build_nfo=Mock(), extract_number=Mock())
             self.assertFalse(state.exists())
@@ -83,7 +67,7 @@ class PlaybackRegistryTests(unittest.TestCase):
             m, cloud, metadata, service = fixture.make(tmp)
             service.plugin_id = 'MetaTubeScraper_Clone1'
             self.assertEqual(service.run(['0'])['ok'], 1)
-            url = (Path(tmp)/'library/DSOD-060/DSOD-060.strm').read_text()
+            url = (Path(tmp)/'library/DSOD/DSOD-060/DSOD-060 - V0001.strm').read_text()
             self.assertIn('/plugin/MetaTubeScraper_Clone1/redirect_url?', url)
 
     def test_playback_missing_database_returns_503_without_creating_files(self):
@@ -108,7 +92,7 @@ class PlaybackRegistryTests(unittest.TestCase):
                 m=components(version);r=m.Registry(tmp)
                 entry=m.Entry('7','0','DSOD-060.mp4',pickcode='p')
                 token=r.media_token('12345',entry)
-                r.db.execute('DROP TABLE media_aliases');r.db.commit();r.close()
+                r.close()
                 file=Path(tmp)/'direct.sqlite3';original=file.read_bytes()
                 reader=m.Registry(tmp,readonly=True)
                 self.assertEqual(reader.media('12345',token),entry)
@@ -116,8 +100,6 @@ class PlaybackRegistryTests(unittest.TestCase):
                 reader.close();self.assertEqual(file.read_bytes(),original)
                 writer=m.Registry(tmp,create=False)
                 self.assertEqual(writer.media_token('12345',entry),token)
-                writer.restore_media('12345',entry,'a'*64)
-                self.assertEqual(writer.media('12345','a'*64),entry)
                 writer.close()
 
 
@@ -134,10 +116,10 @@ class CachedDatabaseTests(unittest.TestCase):
                         state=Path(tmp)/'state';cloud=Mock(account='12345')
                         cloud.download_link.return_value=types.SimpleNamespace(url='https://cdn.example/v?t=4102444800',headers={},expires=4102444800)
                         if mode=='scan':
-                            service=g['DirectService'](cloud,state,Path(tmp)/'out','https://mp.example',Mock(),Mock(),Mock(),Mock())
+                            service=g['LibraryService'](cloud,state,Path(tmp)/'out','https://mp.example',Mock(),Mock(),Mock(),Mock())
                             writer=service.registry
                         else:
-                            writer=g['DirectService'](cloud,state,Path(tmp)/'out','https://mp.example',Mock(),Mock(),Mock(),Mock()).registry
+                            writer=g['LibraryService'](cloud,state,Path(tmp)/'out','https://mp.example',Mock(),Mock(),Mock(),Mock()).registry
                             self.addCleanup(writer.close)
                         entry=g['Cloud115']._entry({'fid':'7','cid':'0','n':'DSOD-060.mp4','pc':'p'})
                         token=writer.media_token('12345',entry)

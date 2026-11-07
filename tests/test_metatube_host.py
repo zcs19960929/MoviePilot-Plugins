@@ -97,7 +97,7 @@ class HostTests(unittest.TestCase):
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(records[-1]['ok'], 1)
                 self.assertEqual(records[-1]['fail'], 0)
-                self.assertTrue((Path(directory)/'library/DSOD-060/movie.nfo').is_file())
+                self.assertTrue((Path(directory)/'library/DSOD/DSOD-060/movie.nfo').is_file())
                 self.assertEqual(plugin.get_service()[0]['kwargs'], {'minutes':90})
 
     def test_real_configuration_change_stops_scan_without_reporting_scrape_failure(self):
@@ -128,7 +128,7 @@ class HostTests(unittest.TestCase):
                     release.set();worker.join(4)
                 self.assertEqual(records[-1]['fail'],0)
                 self.assertTrue(records[-1]['stopped'])
-                self.assertFalse((Path(directory)/'library/DSOD-060/movie.nfo').exists())
+                self.assertFalse((Path(directory)/'library/DSOD/DSOD-060/movie.nfo').exists())
                 plugin.get_data=lambda key:records[-1]
                 page=plugin.get_page()
                 self.assertIn('已停止',str(page))
@@ -257,7 +257,7 @@ class HostTests(unittest.TestCase):
                             EventType=types.SimpleNamespace(PluginAction="plugin-action")):
                 plugin._MetaTubeScraper__scrape_all()
             self.assertEqual(plugin.save_data.call_args.args[1]["ok"], 1)
-            self.assertTrue((Path(directory) / "library/DSOD-060/DSOD-060.strm").is_file())
+            self.assertTrue((Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").is_file())
             self.assertEqual(events, [])
 
     def test_host_factory_uses_real_backend_callbacks_and_independent_auth(self):
@@ -289,7 +289,7 @@ class HostTests(unittest.TestCase):
             self.addCleanup(lambda: plugin._direct_service.close() if plugin._direct_service else None)
             plugin._MetaTubeScraper__scrape_all()
             self.assertEqual(plugin.save_data.call_args.args[1]["ok"], 1)
-            nfo = (Path(directory) / "library/DSOD-060/movie.nfo").read_text()
+            nfo = (Path(directory) / "library/DSOD/DSOD-060/movie.nfo").read_text()
             self.assertIn("Backend title", nfo)
             self.assertNotIn("backend-test", nfo)
             self.assertNotIn("cloud-cookie-fixture", nfo)
