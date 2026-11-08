@@ -16,6 +16,19 @@ HERE = Path(__file__).parent
 
 @unittest.skipUnless(NODE, 'Node.js is required for form expression tests')
 class FormTests(unittest.TestCase):
+    def test_scan_strategy_is_direct_only_and_depth_keeps_its_saved_key(self):
+        for version in ('v2', 'v3'):
+            for storage in ('115_direct', {'value':'115_direct'}):
+                result = self.render(version, storage=storage)
+                fields = result['snapshots'][0]
+                self.assertEqual(result['model']['scan_strategy'], 'full')
+                self.assertEqual(fields['scan_strategy']['label'], '扫描模式')
+                self.assertEqual(fields['scan_strategy']['items'], [
+                    {'title':'全量模式', 'value':'full'}, {'title':'增量模式', 'value':'incremental'}])
+                self.assertEqual(fields['scan_mode']['label'], '扫描范围')
+            for storage in ('local', '115Lite', 'u115'):
+                self.assertNotIn('scan_strategy', self.render(version, storage=storage)['snapshots'][0])
+
     def render(self, version='v3', **values):
         form, model = load_plugin(version, Mock()).get_form()
         changes = values.pop('changes', [])

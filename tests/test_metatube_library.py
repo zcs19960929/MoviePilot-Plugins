@@ -33,8 +33,10 @@ class LibraryAcceptanceTests(unittest.TestCase):
             result = service.run(['7', '8'])
             self.assertEqual(result['fail'], 1)
             self.assertIn('共同上级', ' '.join(result['errors']))
-            self.assertEqual(cloud.moves, [])
-            self.assertEqual(cloud.renames, [])
+            self.assertEqual(cloud.moves, [(['1'], '10')])
+            self.assertEqual(cloud.renames, [('1', 'IPX-922 - V0001.mp4')])
+            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0001.strm').is_file())
+            self.assertEqual(cloud.entries['2'].name, 'IPX-922-B.mkv')
 
     def make(self, directory, entries, archive=False):
         m = library_module()

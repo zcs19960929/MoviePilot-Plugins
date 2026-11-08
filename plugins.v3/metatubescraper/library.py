@@ -7,12 +7,18 @@ import tempfile
 import threading
 import xml.etree.ElementTree as ET
 from collections import defaultdict
+from copy import deepcopy
 from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
 from .cloud115 import AuthenticationError, CloudError, Entry, RiskError, Stopped
 from .direct import PlaybackService, Registry, SUBTITLE_EXTS, VIDEO_EXTS, _part, checked_path, digest
+from .scan_progress import CheckpointError, ScanProgress
+
+
+class ScanReadError(CloudError):
+    """Directory failures must retain the current checkpoint, not skip a movie."""
 
 
 def category(number):
@@ -116,6 +122,12 @@ class LibraryRegistry(Registry):
     def save_version(self, account, root, number, version, files, complete=False):
         with self._lock, self.db:
             self.check_identity()
+            self.db.execute('BEGIN IMMEDIATE')
+            previous = self.db.execute('SELECT files FROM library_versions WHERE account=? AND root=? AND number=? AND version=?',
+                                       (account, str(root), number, version)).fetchone()
+            merged = {item['entry']['id']: item for item in json.loads(previous['files'])} if previous else {}
+            merged.update((item['entry']['id'], item) for item in files)
+            files = list(merged.values())
             self.db.execute('INSERT INTO library_versions VALUES(?,?,?,?,?,?) ON CONFLICT(account,root,number,version) DO UPDATE SET files=excluded.files,complete=excluded.complete',
                             (account, str(root), number, version, json.dumps(files, ensure_ascii=False), int(complete)))
             for item in files:
@@ -156,7 +168,7 @@ def group_videos(number, videos):
 class LibraryService(PlaybackService):
     def __init__(self, client, data_dir, output_root, playback_base_url, metadata,
                  artwork, build_nfo, extract_number, stop_event=None, force=False,
-                 plugin_id='MetaTubeScraper', debug=None, info=None, archive_loose=False, error=None):
+                 plugin_id='MetaTubeScraper', debug=None, info=None, archive_loose=False, error=None, numeric_ids=False):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', plugin_id):
             raise CloudError('插件实例标识无效')
         if not Path(output_root).is_absolute():
@@ -173,15 +185,39 @@ class LibraryService(PlaybackService):
         self.build_nfo, self.extract_number = build_nfo, extract_number
         self.stop_event = stop_event or threading.Event()
         self.force, self.archive_loose = force, archive_loose
+        self.numeric_ids = numeric_ids
         self._debug = debug or (lambda message: None)
         self._info = info or (lambda message: None)
         self._error = error or (lambda message: None)
         self._cache = {}
         self._play_lock = threading.RLock()
+        self._metadata_cache, self._artwork_cache = {}, {}
+        self._refreshed_subtitles = set()
 
     def _stopped(self):
         if self.stop_event.is_set():
             raise Stopped('任务已停止')
+
+    def _listdir(self, cid):
+        try:
+            return self.client.listdir(cid)
+        except (AuthenticationError, RiskError, Stopped):
+            raise
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
+            raise ScanReadError('目录读取失败，已保留扫描位置：'+reason) from None
+
+    def _folder_info(self, cid):
+        try:
+            entry = self.client.info(cid)
+            if not entry.is_dir:
+                raise ScanReadError('目录身份已变化，已保留扫描位置')
+            return entry
+        except (AuthenticationError, RiskError, Stopped, ScanReadError):
+            raise
+        except Exception as exc:
+            reason = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
+            raise ScanReadError('目录核验失败，已保留扫描位置：'+reason) from None
 
     def _folder(self, number):
         folder = self.root/movie_relative(number)
@@ -225,12 +261,12 @@ class LibraryService(PlaybackService):
         groups += list(grouped.values())
         assigned = self.registry.assign_versions(account, self.root, number, groups)
         plans = defaultdict(list)
-        targets = {}
+        targets = {item['target'].casefold(): fid for fid, (_, item) in known.items()}
         for entry in videos:
             version = assigned[entry.id]
             previous = known.get(entry.id)
             target = previous[1]['target'] if previous else variant_stem(number, version, _part(entry.name)) + Path(entry.name).suffix.lower()
-            if target.casefold() in targets:
+            if target.casefold() in targets and targets[target.casefold()] != entry.id:
                 raise CloudError('版本内分段目标重名：' + entry.name)
             targets[target.casefold()] = entry.id
             plans[version].append(dict(entry=asdict(entry), target=target, kind='video',
@@ -245,8 +281,10 @@ class LibraryService(PlaybackService):
                 plans[version].append(dict(item, entry=asdict(entry)))
                 continue
             matches = {}
+            parent_videos = [video for video in videos if video.parent_id == entry.parent_id or
+                             (video.id in known and known[video.id][1].get('source_parent') == entry.parent_id)]
             for video in videos:
-                if video.parent_id != entry.parent_id:
+                if video not in parent_videos:
                     continue
                 aliases = [Path(video.name).stem]
                 if video.id in known:
@@ -263,10 +301,10 @@ class LibraryService(PlaybackService):
             if matches:
                 longest = max(value[0] for value in matches.values())
                 matches = {fid:value for fid,value in matches.items() if value[0] == longest}
-            elif (len([video for video in videos if video.parent_id == entry.parent_id]) == 1
-                  and len([video for video in entries if video.parent_id == entry.parent_id and Path(video.name).suffix.lower() in VIDEO_EXTS]) == 1
+            elif (len(parent_videos) == 1
+                  and len([video for video in entries if video.parent_id == entry.parent_id and Path(video.name).suffix.lower() in VIDEO_EXTS]) <= 1
                   and not self.extract_number(entry.name)):
-                owner = next(video for video in videos if video.parent_id == entry.parent_id)
+                owner = parent_videos[0]
                 matches = {owner.id:(0, Path(entry.name).stem)}
             elif self.extract_number(entry.name) not in (None, number):
                 continue
@@ -324,9 +362,10 @@ class LibraryService(PlaybackService):
         movie = self.registry.movie(account, self.root, number)
         if movie and movie['relative_dir'] != relative:
             raise CloudError('已登记的影片输出位置与番号分类不一致')
-        info = movie['metadata'] if movie else None
-        if not info or self.force:
-            info = self.metadata(number)
+        if number not in self._metadata_cache:
+            info = movie['metadata'] if movie else None
+            self._metadata_cache[number] = self.metadata(number) if not info or self.force else info
+        info = self._metadata_cache[number]
         if not info or not info.get('title'):
             return 'notfound'
         plans = self._plans(number, videos, entries)
@@ -337,7 +376,10 @@ class LibraryService(PlaybackService):
         shared = {'movie.nfo': self._render_nfo(info, number)}
         for kind, name in (('poster','poster.jpg'), ('fanart','fanart.jpg')):
             old = self.registry.owned_bytes(folder/name, account, shared_owner)
-            shared[name] = old if old is not None and not self.force else self.artwork(info, kind)
+            key = (number, kind)
+            if key not in self._artwork_cache:
+                self._artwork_cache[key] = old if old is not None and not self.force else self.artwork(info, kind)
+            shared[name] = self._artwork_cache[key]
             if not shared[name]:
                 raise CloudError('图片下载失败：' + name)
         data = []
@@ -356,7 +398,9 @@ class LibraryService(PlaybackService):
                 else:
                     name = item['target']
                     old = self.registry.owned_bytes(folder/name, account, owner)
-                    content = old if old is not None and not self.force else self.client.download_bytes(entry)
+                    refresh = self.force and entry.id not in self._refreshed_subtitles
+                    content = old if old is not None and not refresh else self.client.download_bytes(entry)
+                    self._refreshed_subtitles.add(entry.id)
                 if not content:
                     raise CloudError('字幕下载结果为空：' + name)
                 data.append((folder/name, content, owner))
@@ -386,7 +430,7 @@ class LibraryService(PlaybackService):
                         original = Entry(**item['entry'])
                         if entry.name != original.name or entry.parent_id != original.parent_id:
                             raise CloudError('文件状态在执行前变化：' + entry.name)
-                        siblings = self.client.listdir(entry.parent_id)
+                        siblings = self._listdir(entry.parent_id)
                         if any(other.id != entry.id and other.name.casefold()==item['target'].casefold() for other in siblings):
                             raise CloudError('云盘目标名称冲突：' + item['target'])
                         self.client.rename(entry.id, item['target'])
@@ -400,14 +444,16 @@ class LibraryService(PlaybackService):
                     self._publish(folder, identity, path, content, owner, staged[path])
                 else:
                     self.registry.published(path, content)
+        self._info(f'本地媒体生成完成 番号={number} 路径={str(folder)!r}')
         if self.archive_loose:
             changed = self._archive_movie(number, plans, cloud_root) or changed
+            self._info(f'网盘整理完成 番号={number} 归档根ID={cloud_root} 目标={movie_relative(number)!r}')
         for version, files in plans.items():
             self.registry.save_version(account, self.root, number, version, files, complete=True)
         return 'ok' if changed else 'skip'
 
     def _directory(self, parent, name):
-        entries = self.client.listdir(parent)
+        entries = self._listdir(parent)
         matches = [entry for entry in entries if entry.name.casefold()==name.casefold()]
         if matches:
             if len(matches)!=1 or not matches[0].is_dir or matches[0].name!=name:
@@ -415,37 +461,37 @@ class LibraryService(PlaybackService):
             return matches[0].id
         self._stopped()
         cid = self.client.mkdir(name, parent)
-        entry = self.client.info(cid)
+        entry = self._folder_info(cid)
         if not entry.is_dir or entry.parent_id!=parent or entry.name!=name:
             raise CloudError('无法核验新建网盘目录：' + name)
         return cid
 
     def _archive_movie(self, number, plans, cloud_root):
         parent = self._directory(cloud_root, category(number))
-        siblings = self.client.listdir(parent)
+        siblings = self._listdir(parent)
         matches = [entry for entry in siblings if entry.name.casefold() == number.casefold()]
         source_parents = {item['entry']['parent_id'] for files in plans.values() for item in files}
         changed = False
         # Keep a new single-movie source directory intact when there is no target.
         if not matches and len(source_parents) == 1:
             source = next(iter(source_parents))
-            folder = self.client.info(source) if source != '0' else None
+            folder = self._folder_info(source) if source != '0' else None
             if (folder and folder.is_dir and source not in (cloud_root, parent)
                     and self.extract_number(folder.name) == number
                     and folder.parent_id in (cloud_root, parent)):
-                contents = self.client.listdir(source)
+                contents = self._listdir(source)
                 managed = {item['entry']['id'] for files in plans.values() for item in files}
                 if all(not entry.is_dir and (Path(entry.name).suffix.lower() not in VIDEO_EXTS | SUBTITLE_EXTS
                                             or entry.id in managed) for entry in contents):
                     self._stopped()
                     if folder.name != number:
                         self.client.rename(source, number)
-                        folder = self.client.info(source)
+                        folder = self._folder_info(source)
                         if folder.name != number:
                             raise CloudError('影片目录改名结果无法确认')
                     if folder.parent_id != parent:
                         self.client.move([source], parent)
-                        folder = self.client.info(source)
+                        folder = self._folder_info(source)
                         if folder.parent_id != parent or folder.name != number:
                             raise CloudError('影片目录移动结果无法确认')
                     matches = [folder]
@@ -459,7 +505,7 @@ class LibraryService(PlaybackService):
                     expected = Entry(**item['entry'])
                     if entry.name!=item['target'] or entry.parent_id!=expected.parent_id:
                         raise CloudError('归档前文件位置发生变化：' + entry.name)
-                    target = self.client.listdir(destination)
+                    target = self._listdir(destination)
                     if any(other.id!=entry.id and other.name.casefold()==entry.name.casefold() for other in target):
                         raise CloudError('归档目标文件名冲突：' + entry.name)
                     self.client.move([entry.id], destination)
@@ -474,83 +520,346 @@ class LibraryService(PlaybackService):
                 (cloud_root, destination, self.client.account, str(self.root), number))
         return changed
 
-    def _scan(self, roots, recursive, max_depth, stats):
-        queue = []
+    @staticmethod
+    def _snapshot(entry):
+        # Resolve playback data live; checkpoints contain no pickcodes or URLs.
+        return dict(id=entry.id, parent_id=entry.parent_id, name=entry.name, is_dir=entry.is_dir)
+
+    def _initial_scan(self, roots):
+        bindings = []
         category_roots = {}
+        selected = {}
         for root in roots:
             cid = self.client.resolve_folder(root)
-            folder = self.client.info(cid) if cid!='0' else None
+            folder = self._folder_info(cid) if cid!='0' else None
+            selected[cid] = folder
+        archive_roots = {}
+        for cid, folder in selected.items():
             name = folder.name if folder else ''
             is_category = self._is_category(name)
             cloud_root = cid
             if folder and is_category:
                 category_roots[cid] = folder
             if folder and self.extract_number(name):
-                parent = self.client.info(folder.parent_id) if folder.parent_id != '0' else None
+                parent = self._folder_info(folder.parent_id) if folder.parent_id != '0' else None
                 cloud_root = parent.parent_id if parent and self._is_category(parent.name) else folder.parent_id
-            queue.append((cid, 0, name, cloud_root, False))
-        seen, movies = set(), defaultdict(lambda:dict(videos=[], entries=[], root=None, roots=set(), paths=set()))
+            # Overlapping selections share the configured parent, regardless of
+            # selection order. Only walk ancestors, never scan their children.
+            ancestor = folder.parent_id if folder else None
+            walked = {cid}
+            while ancestor is not None and ancestor not in walked:
+                walked.add(ancestor)
+                if ancestor in selected:
+                    outer = selected[ancestor]
+                    cloud_root = ancestor
+                    if outer and self.extract_number(outer.name):
+                        parent = self._folder_info(outer.parent_id) if outer.parent_id != '0' else None
+                        cloud_root = parent.parent_id if parent and self._is_category(parent.name) else outer.parent_id
+                if ancestor == '0':
+                    break
+                outer = selected[ancestor] if ancestor in selected else self._folder_info(ancestor)
+                ancestor = outer.parent_id
+            bindings.append([cid, 0, name, cloud_root, False])
+            archive_roots[cid] = cloud_root
+        return dict(version=ScanProgress.VERSION, bindings=bindings, serial=len(bindings),
+                    selected={cid: self._snapshot(folder) if folder else None for cid, folder in selected.items()},
+                    archive_roots=archive_roots,
+                    category_roots={cid: self._snapshot(folder) for cid, folder in category_roots.items()},
+                    queue={str(index): task for index, task in enumerate(bindings)},
+                    current=None, seen=[], attempted=[], owners={}, done=False)
+
+    def _commit_scan(self, state):
+        self._progress.save(state)
+        self._scan_state = state
+
+    def _prepare_scan(self, roots, recursive, max_depth, strategy, stats):
+        scope = dict(account=self.client.account, plugin_id=self.plugin_id, roots=list(roots),
+                     recursive=recursive, max_depth=max_depth, output_root=str(self.root),
+                     archive=self.archive_loose, numeric_ids=self.numeric_ids)
+        signature = digest(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode())
+        self._progress = ScanProgress(self.registry, signature, strategy == 'incremental', self._info)
+        state = self._progress.load() if strategy == 'incremental' else None
+        if strategy == 'full':
+            self._progress.clear()
+        stats['scan_resumed'] = bool(state and not state['done'])
+        self._resuming_scan = stats['scan_resumed']
+        if state is None:
+            state = self._initial_scan(roots)
+        else:
+            # Bind roots by ID before looking at any obsolete source paths.
+            state['selected'] = {cid: self._snapshot(self._folder_info(cid)) if cid != '0' else None
+                                 for cid in state['selected']}
+            if state['done']:
+                state.update(queue={str(index): task for index, task in enumerate(state['bindings'])},
+                             serial=len(state['bindings']), current=None, seen=[], attempted=[], owners={}, done=False)
+                self._info('上一轮增量扫描已完成，从头开启新一轮')
+        self._scan_root_ids = set(state['selected'])
+        self._scan_folders = {cid: Entry(**folder) if folder else None for cid, folder in state['selected'].items()}
+        self._scan_archive_roots = state['archive_roots']
+        self._scan_depth = max_depth if recursive else 1
+        self._attempted = set(state['attempted'])
+        self._cycle_movie_roots = dict(state['owners'])
+        self._current_entries = None
+        self._commit_scan(state)
+        self._info(('增量模式恢复扫描位置：' if stats['scan_resumed'] else
+                    ('增量模式从头扫描：' if strategy == 'incremental' else '全量模式从头扫描：')) + self._next_position())
+
+    def _next_position(self):
+        state = getattr(self, '_scan_state', None)
+        if not state or state['done']:
+            return '本轮已完成' if state and state['done'] else '扫描根目录'
+        current = state['current']
+        if current and current['groups']:
+            batch = current['groups'][min(current['groups'], key=int)]
+            return current['display'] + ' → ' + batch['number']
+        if state['queue']:
+            task = state['queue'][min(state['queue'], key=int)]
+            return task[2] or '/'
+        return '本轮已完成'
+
+    def _advance_scan(self):
+        state = deepcopy(self._scan_state)
+        current = state['current']
+        del current['groups'][min(current['groups'], key=int)]
+        if not current['groups']:
+            state['current'] = None
+            self._current_entries = None
+        state['attempted'] = sorted(self._attempted)
+        state['owners'] = dict(self._cycle_movie_roots)
+        state['done'] = not state['queue'] and state['current'] is None
+        self._commit_scan(state)
+
+    def _check_directory_binding(self, cid):
+        """A queued ID can survive a move; its authorization must also survive."""
+        visited, chain = set(), []
+        original = self._scan_folders.get(cid)
+        while cid not in visited:
+            if cid in self._scan_root_ids:
+                root = self._scan_folders[cid]
+                classified = False
+                if (len(chain) > self._scan_depth and self._is_category(chain[-1].name) and
+                        not (root and self._is_category(root.name))):
+                    prefix = chain[-1]
+                    classified = any(number and category(number) == prefix.name
+                                     for number in (self.extract_number(entry.name) for entry in self._listdir(prefix.id)))
+                if len(chain) - classified <= self._scan_depth:
+                    return original
+                raise ScanReadError('待扫描目录已超出配置扫描深度，已保留位置，请核对目录或执行全量扫描')
+            if cid == '0':
+                break
+            visited.add(cid)
+            folder = self._folder_info(cid)
+            if original is None:
+                original = folder
+            chain.append(folder)
+            cid = folder.parent_id
+        raise ScanReadError('待扫描目录已移出配置扫描范围，已保留位置，请核对目录或执行全量扫描')
+
+    def _scan(self, stats):
+        """Commit a complete directory snapshot before yielding its movies."""
         directory_path = getattr(self.client, 'directory_path', lambda cid:None)
-        while queue:
+        while not self._scan_state['done']:
             self._stopped()
-            cid, depth, folder_name, cloud_root, candidate_category = queue.pop(0)
-            if cid in seen:
+            state = self._scan_state
+            current = state['current']
+            if current is not None:
+                group = current['groups'][min(current['groups'], key=int)]
+                number = group['number']
+                subtitles = [entry for entry in current['media'].values()
+                             if Path(entry['name']).suffix.lower() in SUBTITLE_EXTS and
+                             self.extract_number(entry['name']) in (None, number)]
+                if not (any(fid not in self._attempted for fid in group['videos']) or
+                        any(entry['id'] not in self._attempted for entry in subtitles)):
+                    self._advance_scan()
+                    continue
+                if self._current_entries is None or self._current_entries[0] != current['directory']:
+                    cid = current['directory']
+                    folder = self._check_directory_binding(cid)
+                    self._current_folder_name = folder.name if folder else ''
+                    self._current_entries = (cid, {entry.id: entry for entry in self._listdir(cid)}, False)
+                    self._directory_scope_checks = set()
+                yield number, dict(videos=[], entries=[], root=group['root'], directory=current['directory'],
+                                   paths={current['display']}, video_ids=group['videos'])
                 continue
-            entries = self.client.listdir(cid)
+            if not state['queue']:
+                state = deepcopy(state)
+                state['done'] = True
+                self._commit_scan(state)
+                break
+            key = min(state['queue'], key=int)
+            cid, depth, folder_name, cloud_root, candidate_category = state['queue'][key]
+            if cid in state['seen']:
+                state = deepcopy(state)
+                del state['queue'][key]
+                self._commit_scan(state)
+                continue
+            # Do not pop the directory until all pagination and its snapshot
+            # commit succeed. A read/commit error leaves it at the queue head.
+            if self._resuming_scan:
+                folder = self._check_directory_binding(cid)
+                folder_name = folder.name if folder else ''
+            elif cid in self._scan_folders:
+                folder = self._scan_folders[cid]
+                folder_name = folder.name if folder else ''
+            entries = self._listdir(cid)
+            state = deepcopy(state)
+            del state['queue'][key]
             if candidate_category:
                 numbers = [self.extract_number(entry.name) for entry in entries]
                 if not any(number and category(number) == folder_name for number in numbers):
                     depth += 1
-                    if depth > (max_depth if recursive else 1):
+                    if depth > self._scan_depth:
+                        state['seen'].append(cid)
+                        self._commit_scan(state)
                         continue
-            seen.add(cid)
+            state['seen'].append(cid)
             display = directory_path(cid) or folder_name or '/'
             self._info(('扫描目录已解析：' if depth == 0 else '读取扫描目录：')+repr(display))
             local = defaultdict(list)
             for entry in entries:
                 if entry.is_dir:
-                    candidate = (depth == 0 and not candidate_category and cloud_root not in category_roots
+                    candidate = (depth == 0 and not candidate_category and cloud_root not in state['category_roots']
                                  and self._is_category(entry.name))
                     extra = 0 if candidate else 1
-                    if depth+extra <= (max_depth if recursive else 1):
-                        queue.append((entry.id, depth+extra, entry.name, cloud_root, candidate))
+                    if depth+extra <= self._scan_depth:
+                        state['queue'][str(state['serial'])] = [entry.id, depth+extra, entry.name, cloud_root, candidate]
+                        state['serial'] += 1
                 elif Path(entry.name).suffix.lower() in VIDEO_EXTS:
                     number = self.extract_number(entry.name) or self.extract_number(folder_name)
                     self._debug(f'番号识别 目录={display!r} 原文件名={entry.name!r} 文件ID={entry.id} 番号={number or "未识别"}')
                     if not number:
-                        stats['nomatch'] += 1
-                        self._error(f'番号未识别 目录={display!r} 原文件名={entry.name!r} 文件ID={entry.id}')
+                        if entry.id not in self._attempted:
+                            stats['nomatch'] += 1
+                            self._attempted.add(entry.id)
+                            self._error(f'番号未识别 目录={display!r} 原文件名={entry.name!r} 文件ID={entry.id}')
                     else:
                         local[number].append(entry)
-            for number,videos in local.items():
-                movie = movies[number]
-                movie['videos'].extend(videos)
-                movie['entries'].extend(entry for entry in entries if not entry.is_dir and
-                                        (Path(entry.name).suffix.lower() in VIDEO_EXTS | SUBTITLE_EXTS))
-                base = category_roots.get(cloud_root)
-                resolved_root = base.parent_id if base and base.name == category(number) else cloud_root
-                movie['root'] = movie['root'] or resolved_root
-                movie['roots'].add(resolved_root)
-                movie['paths'].add(display)
-        return movies, seen
+            media = [entry for entry in entries if not entry.is_dir and
+                     Path(entry.name).suffix.lower() in VIDEO_EXTS | SUBTITLE_EXTS]
+            # A partial move may leave only subtitles in the original folder.
+            for entry in media:
+                if Path(entry.name).suffix.lower() not in SUBTITLE_EXTS or entry.id in self._attempted:
+                    continue
+                number = self.extract_number(entry.name) or self.extract_number(folder_name)
+                if not number:
+                    row = self.registry.db.execute('SELECT number FROM library_files WHERE account=? AND root=? AND fid=?',
+                                                   (self.client.account, str(self.root), entry.id)).fetchone()
+                    number = row['number'] if row else None
+                if number:
+                    local.setdefault(number, [])
+            groups = {}
+            for index, (number, videos) in enumerate(local.items()):
+                base = state['category_roots'].get(cloud_root)
+                resolved_root = base['parent_id'] if base and base['name'] == category(number) else cloud_root
+                groups[str(index)] = dict(number=number, videos=[entry.id for entry in videos], root=resolved_root)
+            if groups:
+                state['current'] = dict(directory=cid, display=display,
+                                        media={entry.id: self._snapshot(entry) for entry in media}, groups=groups)
+            state['attempted'] = sorted(self._attempted)
+            self._commit_scan(state)
+            self._current_entries = (cid, {entry.id: entry for entry in media}, True) if groups else None
+            self._current_folder_name = folder_name
+            self._directory_scope_checks = set()
+
+    def _materialize_batch(self, number, context):
+        """Rehydrate only snapshot identities; newly inserted files wait a cycle."""
+        current = self._scan_state['current']
+        cid = current['directory']
+        _, live, fresh = self._current_entries
+        scope_key = (cid, category(number), context['root'])
+        if scope_key not in self._directory_scope_checks:
+            self._scope_categories = {}
+            if not self._within_scan(cid, number, context['root']):
+                raise ScanReadError('恢复目录已移出配置扫描范围，已保留未完成位置')
+            self._directory_scope_checks.add(scope_key)
+        for fid, snapshot in current['media'].items():
+            needed = (fid in context['video_ids'] or
+                      (Path(snapshot['name']).suffix.lower() in SUBTITLE_EXTS and
+                       self.extract_number(snapshot['name']) in (None, number)))
+            if not needed:
+                context['entries'].append(Entry(**snapshot))
+                continue
+            try:
+                entry = live.get(fid) or self.client.info(fid)
+            except (AuthenticationError, RiskError, Stopped):
+                raise
+            except Exception:
+                if fid in context['video_ids']:
+                    raise CloudError('待处理视频已不存在或不可访问：'+snapshot['name']) from None
+                self._error('待处理字幕不可用，已跳过：'+snapshot['name'])
+                continue
+            if entry.is_dir:
+                raise CloudError('待处理文件身份已变化')
+            if not fresh or entry.parent_id != cid:
+                self._scope_categories = {}
+                if not self._within_scan(entry.parent_id, number, context['root']):
+                    raise CloudError('待处理文件已移出配置扫描范围：'+entry.name)
+            if fid in context['video_ids']:
+                actual = self.extract_number(entry.name)
+                if actual and actual != number:
+                    raise CloudError('待处理视频名称指向其他番号：'+entry.name)
+                if not actual and self.extract_number(self._current_folder_name) != number:
+                    raise ScanReadError('快照目录的番号已变化，已保留位置，请执行全量扫描重新识别')
+                context['videos'].append(entry)
+            context['entries'].append(entry)
 
     @staticmethod
     def _is_category(name):
         return name=='数字番号' or bool(re.fullmatch(r'[A-Z]+(?:-[A-Z]+)*|\d{2,3}[A-Z]{2,6}', name))
 
-    def _reconcile_registered(self, number, context, seen):
+    def _within_scan(self, parent, number, cloud_root):
+        """Check current ancestry of registered files without scanning siblings."""
+        visited, chain = set(), []
+        while parent not in visited:
+            if parent in self._scan_root_ids:
+                root_folder = self._scan_folders[parent]
+                resolved_root = self._scan_archive_roots[parent]
+                if root_folder and resolved_root == parent and root_folder.name == category(number):
+                    resolved_root = root_folder.parent_id
+                if self.archive_loose and resolved_root != cloud_root:
+                    return False
+                classified = False
+                if (len(chain) > 1 and chain[-1].name == category(number) and
+                        not (root_folder and self._is_category(root_folder.name))):
+                    # Match _scan's classification test, including the case
+                    # where a sibling rather than this path proves the prefix.
+                    cid = chain[-1].id
+                    if cid not in self._scope_categories:
+                        numbers = (self.extract_number(entry.name) for entry in self._listdir(cid))
+                        self._scope_categories[cid] = any(n and category(n) == chain[-1].name for n in numbers)
+                    classified = self._scope_categories[cid]
+                if len(chain) - classified <= self._scan_depth:
+                    return True
+            if parent == '0':
+                return False
+            visited.add(parent)
+            folder = self._folder_info(parent)
+            if not folder.is_dir:
+                return False
+            chain.append(folder)
+            parent = folder.parent_id
+        return False
+
+    def _reconcile_registered(self, number, context):
+        self._scope_categories = {}
         present = {entry.id for entry in context['videos']}
         present.update(entry.id for entry in context['entries'] if Path(entry.name).suffix.lower() in SUBTITLE_EXTS)
         plans = self.registry.versions(self.client.account, self.root, number)
         checked = set()
         scanned_videos = {entry.id for entry in context['videos']}
+        fresh_parts = {_source_key(entry) for entry in context['videos'] if _part(entry.name)}
         for plan in plans:
-            active_version = any(item['kind'] == 'video' and item['entry']['id'] in scanned_videos
-                                 for item in plan['files'])
+            active_version = any(item['entry']['id'] in present for item in plan['files'])
+            active_version = active_version or any(
+                item['kind'] == 'video' and (
+                    _source_key(Entry(**dict(item['entry'], parent_id=item.get('source_parent', item['entry']['parent_id']))),
+                                item.get('source_name')) in fresh_parts or
+                    (not scanned_videos and item.get('source_parent', item['entry']['parent_id']) == context['directory']))
+                for item in plan['files'])
             for item in plan['files']:
                 # Local publication can be complete while a subtitle remains in
                 # its source directory after an interrupted/disabled archive.
-                if plan['complete'] and (item['kind'] == 'video' or not active_version):
+                if plan['complete'] and not active_version:
                     continue
                 fid = item['entry']['id']
                 if fid in present or fid in checked:
@@ -563,7 +872,7 @@ class LibraryService(PlaybackService):
                 except Exception:
                     self._error(f"历史登记文件不可用 番号={number} 原文件名={item['entry']['name']!r} 文件ID={fid} 原父目录={item['entry']['parent_id']}")
                     continue
-                if entry.is_dir or entry.parent_id not in seen:
+                if entry.is_dir or not self._within_scan(entry.parent_id, number, context['root']):
                     self._error(f"历史登记文件位于扫描范围外 番号={number} 原文件名={entry.name!r} 文件ID={fid} 当前父目录={entry.parent_id}")
                     continue
                 actual_number = self.extract_number(entry.name)
@@ -574,20 +883,26 @@ class LibraryService(PlaybackService):
                 context['entries'].append(entry)
                 present.add(fid)
 
-    def _run(self, roots, recursive, limit, max_depth, stats):
-        movies, seen = self._scan(roots, recursive, max_depth, stats)
-        for number, context in movies.items():
+    def _run(self, limit, stats):
+        batches = self._scan(stats)
+        outcomes, movie_roots = {}, self._cycle_movie_roots
+        priority = {'skip': 0, 'ok': 1, 'notfound': 2, 'fail': 3}
+        while stats['ok']+stats['notfound']+stats['fail'] < limit:
             self._stopped()
-            if stats['ok']+stats['notfound']+stats['fail'] >= limit:
-                break
-            stats['total'] += 1
             try:
-                if self.archive_loose and len(context['roots']) > 1:
+                number, context = next(batches)
+            except StopIteration:
+                break
+            self._info(f'开始处理影片 番号={number} 来源={sorted(context["paths"])!r}')
+            try:
+                previous_root = movie_roots.setdefault(number, context['root'])
+                if self.archive_loose and previous_root != context['root']:
                     raise CloudError('同番号来自多个扫描根目录，请选择共同上级目录后再进行网盘整理')
-                self._reconcile_registered(number, context, seen)
+                self._materialize_batch(number, context)
+                self._reconcile_registered(number, context)
                 unique = {entry.id: entry for entry in context['entries']}
-                status = self._process_movie(number, context['videos'], list(unique.values()), context['root'])
-            except (AuthenticationError, RiskError, Stopped):
+                status = self._process_movie(number, context['videos'], list(unique.values()), context['root']) if context['videos'] else 'skip'
+            except (AuthenticationError, RiskError, Stopped, ScanReadError, CheckpointError):
                 raise
             except Exception as exc:
                 status = 'fail'
@@ -595,8 +910,26 @@ class LibraryService(PlaybackService):
                 stats['errors'].append(number+'：'+message)
                 files = [dict(name=entry.name, id=entry.id, parent=entry.parent_id) for entry in context['videos']]
                 self._error(f'影片处理冲突 目录={sorted(context["paths"])!r} 番号={number} 原文件={files!r} 目标路径={str(self.root/movie_relative(number))!r} 原因={message}')
-            stats[status] += 1
+            self._attempted.update(entry.id for entry in context['videos'])
+            present_ids = {entry.id for entry in context['entries']}
+            for version in self.registry.versions(self.client.account, self.root, number):
+                self._attempted.update(item['entry']['id'] for item in version['files']
+                                       if item['entry']['id'] in present_ids)
+            previous = outcomes.get(number)
+            if previous is None:
+                stats['total'] += 1
+                stats[status] += 1
+                outcomes[number] = status
+            elif priority[status] > priority[previous]:
+                stats[previous] -= 1
+                stats[status] += 1
+                outcomes[number] = status
             self._debug(f'刮削结果 番号={number} 状态={status}')
+            self._advance_scan()
+        else:
+            self._info(f'已达到单次处理上限 {limit} 部，停止扫描后续目录，剩余影片下次执行')
+            if not self._scan_state['done']:
+                stats['scan_pause_reason'] = '达到单次处理上限，进度已保存' if self._progress.enabled else '达到单次处理上限，全量模式下次从头扫描'
         return stats
 
     def _render_nfo(self, info, number):
@@ -613,15 +946,44 @@ class LibraryService(PlaybackService):
         ET.indent(nfo, space="  ")
         return ET.tostring(nfo, encoding="utf-8", xml_declaration=True)
 
-    def run(self, roots, recursive=False, limit=30, max_depth=3):
-        stats = dict(total=0, ok=0, skip=0, nomatch=0, notfound=0, fail=0, errors=[])
+    def _scan_summary(self, stats):
+        state = getattr(self, '_scan_state', None)
+        stats['scan_cycle_complete'] = bool(state and state['done'])
+        stats['scan_next_position'] = ('配置扫描根目录（全量从头）' if stats['scan_strategy'] == 'full'
+                                       else self._next_position())
+        if stats['scan_cycle_complete']:
+            self._info('本轮扫描完成；下次增量任务从头开启新一轮' if stats['scan_strategy'] == 'incremental' else '全量扫描完成')
+        else:
+            self._info('扫描暂停：'+stats.get('scan_pause_reason', '本次任务结束')+'；下次位置：'+stats['scan_next_position'])
+
+    def run(self, roots, recursive=False, limit=30, max_depth=3, scan_strategy='full'):
+        strategy = scan_strategy if scan_strategy in ('full', 'incremental') else 'full'
+        stats = dict(total=0, ok=0, skip=0, nomatch=0, notfound=0, fail=0, errors=[],
+                     scan_strategy=strategy, scan_resumed=False, scan_cycle_complete=False, scan_pause_reason='')
+        self._metadata_cache, self._artwork_cache = {}, {}
+        self._refreshed_subtitles, self._attempted = set(), set()
+        self._scan_state = None
         try:
-            self._run(roots, recursive, limit, max_depth, stats)
+            self._stopped()
+            self._prepare_scan(roots, recursive, max_depth, strategy, stats)
+            self._run(limit, stats)
         except (AuthenticationError, RiskError) as exc:
+            stats['stopped'] = True
+            stats['scan_pause_reason'] = str(exc)
+            self._scan_summary(stats)
             exc.stats = stats
             raise
-        except Stopped:
+        except Stopped as exc:
             stats["stopped"] = True
+            stats['scan_pause_reason'] = str(exc) or '任务已停止，保留未完成位置'
+        except Exception as exc:
+            message = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
+            stats.update(stopped=True, scan_pause_reason=message)
+            stats['fail'] += 1
+            stats['errors'].append(message)
+            self._error('扫描已暂停：'+message)
         if self.stop_event.is_set():
             stats["stopped"] = True
+            stats['scan_pause_reason'] = stats['scan_pause_reason'] or '任务已停止，保留未完成位置'
+        self._scan_summary(stats)
         return stats

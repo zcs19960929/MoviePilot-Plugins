@@ -371,7 +371,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -404,6 +404,7 @@ class MetaTubeScraper(_PluginBase):
     _scan_dirs: List[str] = []
     _dir_labels: Dict[str, str] = {}
     _scan_mode = "subdir"
+    _scan_strategy = "full"
     _file_interval = 3
     _movie_limit = 30
     _schedule = None
@@ -488,6 +489,8 @@ class MetaTubeScraper(_PluginBase):
             key: value for key, value in labels.items() if isinstance(value, str) and value.startswith("/")
         } if isinstance(labels, dict) else {}
         self._scan_mode = config.get("scan_mode") or "subdir"
+        strategy = _pick_str(config.get("scan_strategy"), "full")
+        self._scan_strategy = strategy if strategy in ("full", "incremental") else "full"
         for key, default, attr in (
             ("file_interval", 3, "_file_interval"),
             ("movie_limit", 30, "_movie_limit"),
@@ -610,6 +613,7 @@ class MetaTubeScraper(_PluginBase):
                     stop_event=self._stop_event, force=self._force, plugin_id=self.__class__.__name__,
                     debug=backend.debug, info=backend.info, error=backend.error,
                     archive_loose=self._archive_loose,
+                    numeric_ids=self._numeric_ids,
                 )
             return self._direct_service
 
@@ -1277,7 +1281,7 @@ class MetaTubeScraper(_PluginBase):
                         raise Stopped("配置已更新，任务已停止")
                     service = self.__get_direct_service()
                     roots, recursive, limit = list(self._scan_dirs), self._scan_mode == "recursive", self._movie_limit
-                result = service.run(roots, recursive=recursive, limit=limit)
+                result = service.run(roots, recursive=recursive, limit=limit, scan_strategy=self._scan_strategy)
                 stats.update(result)
                 for message in result.get("errors", []):
                     self.warn(message)
@@ -1314,7 +1318,7 @@ class MetaTubeScraper(_PluginBase):
             if task_stop_event.is_set():
                 stats["stopped"] = True
             if stats.get("stopped"):
-                stats["stop_reason"] = "配置更新、插件停用或重载已停止本次任务；保存完成后可重新执行。"
+                stats["stop_reason"] = stats.get("scan_pause_reason") or "配置更新、插件停用或重载已停止本次任务；保存完成后可重新执行。"
             self._running = False
             with self._direct_lock:
                 for retired in getattr(self, "_retired_services", []):
@@ -1491,6 +1495,15 @@ class MetaTubeScraper(_PluginBase):
             text += " | 错误：" + "；".join(stats["errors"][-3:])
         if stats.get("stop_reason"):
             text += " | " + stats["stop_reason"]
+        if stats.get("scan_strategy"):
+            incremental = stats['scan_strategy'] == 'incremental'
+            text += " | 扫描模式: " + ("增量模式" if incremental else "全量模式")
+            text += "（恢复上次进度）" if stats.get('scan_resumed') else "（从头开始）"
+            text += " | " + ("本轮已完成，下次从头开始" if stats.get('scan_cycle_complete') else "本轮尚未结束")
+            if not stats.get('scan_cycle_complete'):
+                text += " | 下次位置: " + stats.get('scan_next_position', '扫描根目录')
+            if stats.get('scan_pause_reason'):
+                text += " | " + stats['scan_pause_reason']
         return schedule_notice + [{
             "component": "VAlert",
             "props": {
@@ -1673,13 +1686,19 @@ class MetaTubeScraper(_PluginBase):
                 ]},
             ]},
             row(col({"component": "VSelect", "props": {
-                    "model": "scan_mode", "label": "扫描模式",
+                    "model": "scan_strategy", "label": "扫描模式", "returnObject": False,
+                    "items": [{"title": "全量模式", "value": "full"}, {"title": "增量模式", "value": "incremental"}],
+                    "hint": "全量每次从头扫描并清除旧扫描进度；增量接着未完成位置，扫完整轮后下次从头开启新一轮。均受单次上限控制。",
+                    "persistent-hint": True,
+                }}, show=direct), col({"component": "VSelect", "props": {
+                    "model": "scan_mode", "label": "扫描范围",
                     "items": expr(f"[{{title: {direct} ? '扫描根目录及一级子目录' : '仅扫描一级影片子目录', value: 'subdir'}}, {{title: '递归扫描', value: 'recursive'}}]"),
                     "hint": expr(f"{direct} ? '包含根目录散装视频；分类目录不占影片扫描深度，递归最多 3 层' : ({local} ? '递归遇到影片目录后停止继续深入' : '递归最多 3 层，请求较多')"),
                     "persistent-hint": True,
                 }}),
                 text("file_interval", "兼容模式读写间隔（秒）", "3", "受控读写前的等待时间，不是风控安全保证", show=legacy)),
-            row(text("movie_limit", "单次处理影片上限", "30", "每轮处理上限，剩余影片下次继续"),
+            row(text("movie_limit", "单次处理影片上限", "30",
+                     expr(f"{direct} ? '每次任务的影片上限；增量下次接着未完成位置，全量下次从头扫描' : '每次任务的影片上限，剩余影片下次继续'")),
                 col({"component": "VSelect", "props": {
                     "model": "schedule_mode", "label": "调度方式", "returnObject": False,
                     "items": [
@@ -1724,7 +1743,7 @@ class MetaTubeScraper(_PluginBase):
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
-            "organize": False, "trigger_strm": True, "scan_mode": "subdir", "file_interval": 3,
+            "organize": False, "trigger_strm": True, "scan_mode": "subdir", "scan_strategy": "full", "file_interval": 3,
             "movie_limit": 30, "cron_hour": 4, "cron_minute": 30, "force_overwrite": False,
             "schedule_mode": "daily", "schedule_weekday": "mon", "schedule_interval": 60, "cron_expression": "30 4 * * *",
             "download_previews": False, "preview_limit": 10, "rename_files": False, "numeric_ids": False,
