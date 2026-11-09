@@ -78,6 +78,15 @@ class FakeCloud:
                 self.interrupt_move_after = None
                 raise RuntimeError("simulated partial move")
 
+    def recycle_empty_directory(self, cid, parent_id, name, protected=()):
+        entry = self.info(cid)
+        if cid in protected or not entry.is_dir or (entry.parent_id, entry.name) != (parent_id, name):
+            raise self.module.CloudError('unsafe cleanup')
+        if self.listdir(cid):
+            return False
+        del self.entries[cid]
+        return True
+
     def download_bytes(self, entry):
         self.downloads.append(entry.id)
         return ("subtitle:" + entry.id).encode()

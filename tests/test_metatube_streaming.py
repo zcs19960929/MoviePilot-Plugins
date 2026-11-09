@@ -155,6 +155,8 @@ class StreamingTests(unittest.TestCase):
         ])
         self.assertEqual(service.run(['7'])['ok'], 1)
         original_link = (service.root/'IPX/IPX-201/IPX-201 - V0001-CD1.strm').read_bytes()
+        # A new upload recreates the old incoming directory after empty cleanup.
+        cloud.entries['8'] = m.Entry('8', '7', 'IPX-201', is_dir=True)
         cloud.entries['2'] = m.Entry('2', '8', 'IPX-201-CD2.mp4', pickcode='b'*17)
         result = service.run(['7'])
         self.assertEqual(result['fail'], 0)

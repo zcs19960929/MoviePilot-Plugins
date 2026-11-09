@@ -3,6 +3,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import sqlite3
 import tempfile
 import threading
 import xml.etree.ElementTree as ET
@@ -15,6 +17,8 @@ from urllib.parse import urlsplit
 from .cloud115 import AuthenticationError, CloudError, Entry, NotFoundError, RiskError, Stopped
 from .direct import PlaybackService, Registry, SUBTITLE_EXTS, VIDEO_EXTS, _part, checked_path, digest
 from .scan_progress import CheckpointError, ScanProgress
+from .classification import ClassificationPolicy, directory_name
+from .migration import MigrationManager
 
 
 class ScanReadError(CloudError):
@@ -34,10 +38,10 @@ def category(number):
     return '数字番号' if prefix.isdigit() else prefix
 
 
-def movie_relative(number):
+def movie_relative(number, group=None):
     if not re.fullmatch(r'[A-Z0-9][A-Z0-9-]*', number):
         raise CloudError('番号不适合作为输出目录')
-    return str(Path(category(number))/number)
+    return str(Path(directory_name(group) if group is not None else category(number))/number)
 
 
 def movie_job(root, number):
@@ -176,7 +180,8 @@ def group_videos(number, videos):
 class LibraryService(PlaybackService):
     def __init__(self, client, data_dir, output_root, playback_base_url, metadata,
                  artwork, build_nfo, extract_number, stop_event=None, force=False,
-                 plugin_id='MetaTubeScraper', debug=None, info=None, archive_loose=False, error=None, numeric_ids=False):
+                 plugin_id='MetaTubeScraper', debug=None, info=None, archive_loose=False, error=None, numeric_ids=False,
+                 library_layout='prefix', maker_groups=None, archive_root='', cleanup_empty_dirs=True):
         if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', plugin_id):
             raise CloudError('插件实例标识无效')
         if not Path(output_root).is_absolute():
@@ -194,6 +199,13 @@ class LibraryService(PlaybackService):
         self.stop_event = stop_event or threading.Event()
         self.force, self.archive_loose = force, archive_loose
         self.numeric_ids = numeric_ids
+        self.policy = ClassificationPolicy(library_layout, maker_groups)
+        self.archive_root = str(archive_root or '').strip()
+        self.cleanup_empty_dirs = bool(cleanup_empty_dirs)
+        self._archive_id = None
+        self._relatives = {}
+        self._origin_ancestors = {}
+        self._registered_migration = False
         self._debug = debug or (lambda message: None)
         self._info = info or (lambda message: None)
         self._error = error or (lambda message: None)
@@ -201,6 +213,8 @@ class LibraryService(PlaybackService):
         self._play_lock = threading.RLock()
         self._metadata_cache, self._artwork_cache = {}, {}
         self._refreshed_subtitles = set()
+        self.migrations = MigrationManager(self)
+        self._registered_categories = self.migrations.categories()
 
     def _stopped(self):
         if self.stop_event.is_set():
@@ -232,10 +246,88 @@ class LibraryService(PlaybackService):
             raise ScanReadError('目录核验失败，已保留扫描位置：'+reason) from None
 
     def _folder(self, number):
-        folder = self.root/movie_relative(number)
+        folder = self.root/self._relative(number)
         checked_path(self.root, folder/'movie.nfo')
         folder.mkdir(parents=True, exist_ok=True)
         return folder
+
+    def _relative(self, number):
+        if number in self._relatives:
+            return self._relatives[number]
+        movie = self.registry.movie(self.client.account, self.root, number)
+        return movie['relative_dir'] if movie else movie_relative(number, self.policy.category(number))
+
+    def _ancestors(self, parent):
+        if parent in self._origin_ancestors:
+            return self._origin_ancestors[parent]
+        chain, seen, current = [], set(), parent
+        while current not in seen:
+            seen.add(current)
+            chain.append(current)
+            if current == '0':
+                break
+            folder = self._scan_folders.get(current) or self._folder_info(current)
+            current = folder.parent_id
+        self._origin_ancestors[parent] = chain
+        return chain
+
+    def _origin_allowed(self, origin):
+        return bool(origin and self._scan_root_ids.intersection(origin['ancestors']))
+
+    def _origin_root(self, origin, number):
+        # Rebinding a common ancestor deliberately changes the archive basis.
+        for cid in reversed(origin['ancestors']):
+            if cid in self._scan_root_ids:
+                root = self._scan_archive_roots[cid]
+                category_root = self._scan_state['category_roots'].get(root)
+                if category_root and self._category_matches(category_root['name'], number):
+                    root = category_root['parent_id']
+                return root
+        return None
+
+    def _remember_origins(self, plans, source_root):
+        for files in plans.values():
+            for item in files:
+                entry = Entry(**item['entry'])
+                origin = self.migrations.origin(entry.id)
+                if origin:
+                    if not self._origin_allowed(origin):
+                        raise CloudError('文件来源已移出授权扫描根，冻结迁移：'+entry.name)
+                    continue
+                parents = self._ancestors(entry.parent_id)
+                if not self._scan_root_ids.intersection(parents):
+                    raise CloudError('无法核验文件原始扫描范围：'+entry.name)
+                self.migrations.record_origin(entry, source_root, parents)
+
+    def _entry_allowed(self, entry, number, source_root):
+        if self._within_scan(entry.parent_id, number, source_root):
+            return True
+        origin = self.migrations.origin(entry.id)
+        if not self._origin_allowed(origin):
+            return False
+        if self.archive_loose and self._archive_id is None and self._origin_root(origin, number) != source_root:
+            return False
+        row = self.registry.db.execute('SELECT number FROM library_files WHERE account=? AND root=? AND fid=?',
+                                       (self.client.account, str(self.root), entry.id)).fetchone()
+        if not row or row['number'] != number:
+            return False
+        movie = self.registry.movie(self.client.account, self.root, number)
+        plan = self.migrations.plan(number) or {}
+        targets = set(plan.get('cloud_targets', []))
+        if self._archive_id is not None:
+            targets.add(self._archive_id)
+        if movie and movie['cloud_root']:
+            targets.add(movie['cloud_root'])
+        return bool(targets.intersection(self._ancestors(entry.parent_id)))
+
+    def _category_matches(self, name, number):
+        return self.policy.matches(name, number, self._registered_categories)
+
+    def _protected_cloud_roots(self):
+        roots = {'0'} | self._scan_root_ids | set(self._scan_archive_roots.values())
+        if self._archive_id is not None:
+            roots.add(self._archive_id)
+        return roots
 
     def _check_folder(self, folder, identity):
         checked_path(self.root, folder/'movie.nfo')
@@ -370,17 +462,28 @@ class LibraryService(PlaybackService):
     def _process_movie(self, number, videos, entries, cloud_root):
         self._stopped()
         account = self.client.account
-        relative = movie_relative(number)
         movie = self.registry.movie(account, self.root, number)
-        if movie and movie['relative_dir'] != relative:
-            raise CloudError('已登记的影片输出位置与番号分类不一致')
+        for version in self.registry.versions(account, self.root, number):
+            for item in version['files']:
+                origin = self.migrations.origin(item['entry']['id'])
+                if origin and not self._origin_allowed(origin):
+                    raise CloudError('影片含已移除来源的版本，冻结迁移：'+item['entry']['name'])
+                if (origin and self.archive_loose and self._archive_id is None and
+                        self._origin_root(origin, number) != cloud_root):
+                    raise CloudError('同番号来自独立扫描根，请选择共同上级或指定统一网盘目标')
         if number not in self._metadata_cache:
             info = movie['metadata'] if movie else None
             self._metadata_cache[number] = self.metadata(number) if not info or self.force else info
         info = self._metadata_cache[number]
         if not info or not info.get('title'):
             return 'notfound'
+        relative = movie_relative(number, self.policy.category(number, info))
+        self._relatives[number] = relative
         plans = self._plans(number, videos, entries)
+        self._remember_origins(plans, cloud_root)
+        owners = {movie_job(self.root, number)} | {version_job(self.root, number, version['version'])
+                                                for version in self.registry.versions(account, self.root, number)}
+        relocated = self.migrations.relocate_local(number, relative, owners)
         self.registry.ensure_movie(account, self.root, number, relative, info)
         folder = self._folder(number)
         identity = folder.stat()
@@ -395,7 +498,7 @@ class LibraryService(PlaybackService):
             if not shared[name]:
                 raise CloudError('图片下载失败：' + name)
         data = []
-        changed = False
+        changed = relocated
         for version, files in plans.items():
             owner = version_job(self.root, number, version)
             self.registry.save_version(account, self.root, number, version, files)
@@ -438,17 +541,20 @@ class LibraryService(PlaybackService):
                 for item in files:
                     self._stopped()
                     entry = self.client.info(item['entry']['id'])
-                    if entry.name != item['target']:
+                    if entry.name != item['target'] and (self.archive_loose or not self._registered_migration):
                         original = Entry(**item['entry'])
                         if entry.name != original.name or entry.parent_id != original.parent_id:
                             raise CloudError('文件状态在执行前变化：' + entry.name)
                         siblings = self._listdir(entry.parent_id)
                         if any(other.id != entry.id and other.name.casefold()==item['target'].casefold() for other in siblings):
                             raise CloudError('云盘目标名称冲突：' + item['target'])
-                        self.client.rename(entry.id, item['target'])
-                        entry = self.client.info(entry.id)
+                        if self._registered_migration:
+                            self._mutate_cloud('rename', entry.id, item['target'])
+                        else:
+                            self.client.rename(entry.id, item['target'])
+                        entry = self._mutate_cloud('info', entry.id)
                         if entry.name != item['target']:
-                            raise CloudError('文件改名结果无法确认：' + item['target'])
+                            raise CheckpointError('文件改名结果无法确认：' + item['target'])
                     item['entry'] = asdict(entry)
                     self.registry.save_version(account, self.root, number, version, files)
             for path, content, owner in data:
@@ -457,12 +563,29 @@ class LibraryService(PlaybackService):
                 else:
                     self.registry.published(path, content)
         self._info(f'本地媒体生成完成 番号={number} 路径={str(folder)!r}')
+        archive_changed = False
         if self.archive_loose:
-            changed = self._archive_movie(number, plans, cloud_root) or changed
-            self._info(f'网盘整理完成 番号={number} 归档根ID={cloud_root} 目标={movie_relative(number)!r}')
+            archive_changed = self._archive_movie(number, plans, cloud_root)
+            changed = archive_changed or changed
+            self._info(f'网盘整理完成 番号={number} 归档根ID={self._archive_id or cloud_root} 目标={relative!r}')
         for version, files in plans.items():
             self.registry.save_version(account, self.root, number, version, files, complete=True)
+        refresh_needed = self.migrations.finish(number, self._policy_signature)
+        if refresh_needed or relocated or (movie and archive_changed):
+            self._migrated.add(number)
+        self._registered_categories.add(Path(relative).parts[0])
         return 'ok' if changed else 'skip'
+
+    def _mutate_cloud(self, method, *args):
+        """Uncertain mutation outcomes must replay before advancing the cursor."""
+        self._stopped()
+        try:
+            return getattr(self.client, method)(*args)
+        except (AuthenticationError, RiskError, Stopped):
+            raise
+        except Exception as exc:
+            detail = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
+            raise CheckpointError('网盘操作结果未确认，保留未完成位置：'+detail) from None
 
     def _directory(self, parent, name):
         entries = self._listdir(parent)
@@ -472,23 +595,42 @@ class LibraryService(PlaybackService):
                 raise CloudError('网盘目录名称冲突：' + name)
             return matches[0].id
         self._stopped()
-        cid = self.client.mkdir(name, parent)
-        entry = self._folder_info(cid)
+        cid = self._mutate_cloud('mkdir', name, parent)
+        try:
+            entry = self._folder_info(cid)
+        except DirectoryGone:
+            raise CheckpointError('新建网盘目录结果未确认，保留未完成位置') from None
         if not entry.is_dir or entry.parent_id!=parent or entry.name!=name:
             raise CloudError('无法核验新建网盘目录：' + name)
         return cid
 
     def _archive_movie(self, number, plans, cloud_root):
-        parent = self._directory(cloud_root, category(number))
+        source_root = cloud_root
+        cloud_root = self._archive_id if self._archive_id is not None else cloud_root
+        self.migrations.cloud_intent(number, cloud_root)
+        parent = self._directory(cloud_root, Path(self._relative(number)).parts[0])
         siblings = self._listdir(parent)
         matches = [entry for entry in siblings if entry.name.casefold() == number.casefold()]
         source_parents = {item['entry']['parent_id'] for files in plans.values() for item in files}
+        old_folders = []
+        for cid in source_parents:
+            if cid == '0':
+                continue
+            folder = self._folder_info(cid)
+            if self.extract_number(folder.name) == number:
+                old_folders.append(folder)
+                if folder.parent_id not in self._protected_cloud_roots():
+                    old_parent = self._folder_info(folder.parent_id)
+                    if self._category_matches(old_parent.name, number):
+                        old_folders.append(old_parent)
+            elif self._category_matches(folder.name, number):
+                old_folders.append(folder)
         changed = False
         # Keep a new single-movie source directory intact when there is no target.
-        if not matches and len(source_parents) == 1:
+        if not matches and len(source_parents) == 1 and self.policy.layout == 'prefix' and self._archive_id is None:
             source = next(iter(source_parents))
             folder = self._folder_info(source) if source != '0' else None
-            if (folder and folder.is_dir and source not in (cloud_root, parent)
+            if (folder and folder.is_dir and source not in self._protected_cloud_roots() and source != parent
                     and self.extract_number(folder.name) == number
                     and folder.parent_id in (cloud_root, parent)):
                 contents = self._listdir(source)
@@ -497,18 +639,20 @@ class LibraryService(PlaybackService):
                                             or entry.id in managed) for entry in contents):
                     self._stopped()
                     if folder.name != number:
-                        self.client.rename(source, number)
+                        self._mutate_cloud('rename', source, number)
                         folder = self._folder_info(source)
                         if folder.name != number:
                             raise CloudError('影片目录改名结果无法确认')
                     if folder.parent_id != parent:
-                        self.client.move([source], parent)
+                        self._mutate_cloud('move', [source], parent)
                         folder = self._folder_info(source)
                         if folder.parent_id != parent or folder.name != number:
                             raise CloudError('影片目录移动结果无法确认')
                     matches = [folder]
                     changed = True
         destination = matches[0].id if len(matches) == 1 and matches[0].is_dir and matches[0].name == number else self._directory(parent, number)
+        self.migrations.add_cloud_cleanup(number, [entry for entry in old_folders if entry.id not in (destination, parent)])
+        self.migrations.cloud_files(number, plans, destination)
         for version, files in plans.items():
             for item in files:
                 self._stopped()
@@ -520,16 +664,17 @@ class LibraryService(PlaybackService):
                     target = self._listdir(destination)
                     if any(other.id!=entry.id and other.name.casefold()==entry.name.casefold() for other in target):
                         raise CloudError('归档目标文件名冲突：' + entry.name)
-                    self.client.move([entry.id], destination)
-                    entry = self.client.info(entry.id)
+                    self._mutate_cloud('move', [entry.id], destination)
+                    entry = self._mutate_cloud('info', entry.id)
                     if entry.parent_id!=destination or entry.name!=item['target']:
-                        raise CloudError('归档结果无法确认：' + item['target'])
+                        raise CheckpointError('归档结果无法确认：' + item['target'])
                     changed = True
                 item['entry'] = asdict(entry)
                 self.registry.save_version(self.client.account, self.root, number, version, files)
         with self.registry.db:
             self.registry.db.execute('UPDATE library_movies SET cloud_root=?,cloud_folder=? WHERE account=? AND root=? AND number=?',
                 (cloud_root, destination, self.client.account, str(self.root), number))
+        self.migrations.add_cloud_cleanup(number, [entry for entry in old_folders if entry.id != destination and entry.id != parent])
         return changed
 
     @staticmethod
@@ -578,7 +723,7 @@ class LibraryService(PlaybackService):
                     archive_roots=archive_roots,
                     category_roots={cid: self._snapshot(folder) for cid, folder in category_roots.items()},
                     queue={str(index): task for index, task in enumerate(bindings)},
-                    current=None, seen=[], attempted=[], owners={}, done=False)
+                    current=None, seen=[], attempted=[], owners={}, done=False, cycle_id=secrets.token_hex(16))
 
     def _commit_scan(self, state):
         self._progress.save(state)
@@ -587,7 +732,8 @@ class LibraryService(PlaybackService):
     def _prepare_scan(self, roots, recursive, max_depth, strategy, stats):
         scope = dict(account=self.client.account, plugin_id=self.plugin_id, roots=list(roots),
                      recursive=recursive, max_depth=max_depth, output_root=str(self.root),
-                     archive=self.archive_loose, numeric_ids=self.numeric_ids)
+                     archive=self.archive_loose, numeric_ids=self.numeric_ids,
+                     classification=self.policy.signature, archive_root=self.archive_root)
         signature = digest(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode())
         self._progress = ScanProgress(self.registry, signature, strategy == 'incremental', self._info)
         state = self._progress.load() if strategy == 'incremental' else None
@@ -603,12 +749,34 @@ class LibraryService(PlaybackService):
                                  for cid in state['selected']}
             if state['done']:
                 state.update(queue={str(index): task for index, task in enumerate(state['bindings'])},
-                             serial=len(state['bindings']), current=None, seen=[], attempted=[], owners={}, done=False)
+                             serial=len(state['bindings']), current=None, seen=[], attempted=[], owners={}, done=False,
+                             cycle_id=secrets.token_hex(16))
                 self._info('上一轮增量扫描已完成，从头开启新一轮')
         self._scan_root_ids = set(state['selected'])
         self._scan_folders = {cid: Entry(**folder) if folder else None for cid, folder in state['selected'].items()}
         self._scan_archive_roots = state['archive_roots']
         self._scan_depth = max_depth if recursive else 1
+        self._origin_ancestors, self._relatives, self._scope_categories = {}, {}, {}
+        self._archive_id = None
+        if self.archive_loose and self.archive_root:
+            self._archive_id = state.get('archive_target')
+            if self._archive_id is None:
+                self._archive_id = self.client.resolve_folder(self.archive_root)
+            if self._archive_id != '0':
+                self._folder_info(self._archive_id)
+            state['archive_target'] = self._archive_id
+        self._excluded_scan_ids = set()
+        if self._archive_id is not None and self._archive_id != '0':
+            ancestors = self._ancestors(self._archive_id)[1:]
+            if self._scan_root_ids.intersection(ancestors):
+                self._excluded_scan_ids.add(self._archive_id)
+                for cid in self._scan_root_ids:
+                    if self._archive_id in self._ancestors(cid):
+                        self._excluded_scan_ids.add(cid)
+        state.setdefault('cycle_id', secrets.token_hex(16))
+        self._policy_signature = digest(json.dumps(dict(policy=self.policy.signature,
+            archive=self.archive_loose, target=self._archive_id,
+            roots=state['archive_roots']), sort_keys=True).encode())
         self._attempted = set(state['attempted'])
         self._cycle_movie_roots = dict(state['owners'])
         self._current_entries = None
@@ -672,7 +840,7 @@ class LibraryService(PlaybackService):
                 if (len(chain) > self._scan_depth and self._is_category(chain[-1].name) and
                         not (root and self._is_category(root.name))):
                     prefix = chain[-1]
-                    classified = any(number and category(number) == prefix.name
+                    classified = any(number and self._category_matches(prefix.name, number)
                                      for number in (self.extract_number(entry.name) for entry in self._listdir(prefix.id)))
                 if len(chain) - classified <= self._scan_depth:
                     return original
@@ -725,7 +893,7 @@ class LibraryService(PlaybackService):
                 break
             key = min(state['queue'], key=int)
             cid, depth, folder_name, cloud_root, candidate_category = state['queue'][key]
-            if cid in state['seen']:
+            if cid in state['seen'] or cid in self._excluded_scan_ids:
                 state = deepcopy(state)
                 del state['queue'][key]
                 self._commit_scan(state)
@@ -750,7 +918,7 @@ class LibraryService(PlaybackService):
             del state['queue'][key]
             if candidate_category:
                 numbers = [self.extract_number(entry.name) for entry in entries]
-                if not any(number and category(number) == folder_name for number in numbers):
+                if not any(number and self._category_matches(folder_name, number) for number in numbers):
                     depth += 1
                     if depth > self._scan_depth:
                         state['seen'].append(cid)
@@ -794,7 +962,7 @@ class LibraryService(PlaybackService):
             groups = {}
             for index, (number, videos) in enumerate(local.items()):
                 base = state['category_roots'].get(cloud_root)
-                resolved_root = base['parent_id'] if base and base['name'] == category(number) else cloud_root
+                resolved_root = base['parent_id'] if base and self._category_matches(base['name'], number) else cloud_root
                 groups[str(index)] = dict(number=number, videos=[entry.id for entry in videos], root=resolved_root)
             if groups:
                 state['current'] = dict(directory=cid, display=display,
@@ -836,7 +1004,7 @@ class LibraryService(PlaybackService):
                 raise CloudError('待处理文件身份已变化')
             if not fresh or entry.parent_id != cid:
                 self._scope_categories = {}
-                if not self._within_scan(entry.parent_id, number, context['root']):
+                if not self._entry_allowed(entry, number, context['root']):
                     raise CloudError('待处理文件已移出配置扫描范围：'+entry.name)
             if fid in context['video_ids']:
                 actual = self.extract_number(entry.name)
@@ -847,9 +1015,8 @@ class LibraryService(PlaybackService):
                 context['videos'].append(entry)
             context['entries'].append(entry)
 
-    @staticmethod
-    def _is_category(name):
-        return name=='数字番号' or bool(re.fullmatch(r'[A-Z]+(?:-[A-Z]+)*|\d{2,3}[A-Z]{2,6}', name))
+    def _is_category(self, name):
+        return self.policy.is_category(name, self._registered_categories)
 
     def _within_scan(self, parent, number, cloud_root):
         """Check current ancestry of registered files without scanning siblings."""
@@ -858,19 +1025,19 @@ class LibraryService(PlaybackService):
             if parent in self._scan_root_ids:
                 root_folder = self._scan_folders[parent]
                 resolved_root = self._scan_archive_roots[parent]
-                if root_folder and resolved_root == parent and root_folder.name == category(number):
+                if root_folder and resolved_root == parent and self._category_matches(root_folder.name, number):
                     resolved_root = root_folder.parent_id
-                if self.archive_loose and resolved_root != cloud_root:
+                if self.archive_loose and self._archive_id is None and resolved_root != cloud_root:
                     return False
                 classified = False
-                if (len(chain) > 1 and chain[-1].name == category(number) and
+                if (len(chain) > 1 and self._category_matches(chain[-1].name, number) and
                         not (root_folder and self._is_category(root_folder.name))):
                     # Match _scan's classification test, including the case
                     # where a sibling rather than this path proves the prefix.
                     cid = chain[-1].id
                     if cid not in self._scope_categories:
                         numbers = (self.extract_number(entry.name) for entry in self._listdir(cid))
-                        self._scope_categories[cid] = any(n and category(n) == chain[-1].name for n in numbers)
+                        self._scope_categories[cid] = any(n and self._category_matches(chain[-1].name, n) for n in numbers)
                     classified = self._scope_categories[cid]
                 if len(chain) - classified <= self._scan_depth:
                     return True
@@ -916,7 +1083,7 @@ class LibraryService(PlaybackService):
                 except Exception:
                     self._error(f"历史登记文件不可用 番号={number} 原文件名={item['entry']['name']!r} 文件ID={fid} 原父目录={item['entry']['parent_id']}")
                     continue
-                if entry.is_dir or not self._within_scan(entry.parent_id, number, context['root']):
+                if entry.is_dir or not self._entry_allowed(entry, number, context['root']):
                     self._error(f"历史登记文件位于扫描范围外 番号={number} 原文件名={entry.name!r} 文件ID={fid} 当前父目录={entry.parent_id}")
                     continue
                 actual_number = self.extract_number(entry.name)
@@ -928,7 +1095,13 @@ class LibraryService(PlaybackService):
                 present.add(fid)
 
     def _run(self, limit, stats):
-        batches = self._scan(stats)
+        def work():
+            for number in list(self.migrations.numbers(self._policy_signature, self._scan_state['cycle_id'])):
+                if (self.policy.layout == 'prefix' and not self.archive_root and not self.migrations.plan(number)):
+                    continue
+                yield number, dict(registered=True, videos=[], entries=[], paths={'登记库迁移任务'}, root=None)
+            yield from self._scan(stats)
+        batches = work()
         outcomes, movie_roots = {}, self._cycle_movie_roots
         priority = {'skip': 0, 'ok': 1, 'notfound': 2, 'fail': 3}
         while stats['ok']+stats['notfound']+stats['fail'] < limit:
@@ -938,17 +1111,27 @@ class LibraryService(PlaybackService):
             except StopIteration:
                 break
             self._info(f'开始处理影片 番号={number} 来源={sorted(context["paths"])!r}')
+            plan = self.migrations.plan(number) or {}
+            self._registered_migration = bool(context.get('registered') and
+                (self.policy.layout == 'maker' or self.archive_root or plan.get('local_cleanup')))
             try:
+                if context.get('registered'):
+                    self._registered_batch(number, context)
                 previous_root = movie_roots.setdefault(number, context['root'])
-                if self.archive_loose and previous_root != context['root']:
+                if self.archive_loose and self._archive_id is None and previous_root != context['root']:
                     raise CloudError('同番号来自多个扫描根目录，请选择共同上级目录后再进行网盘整理')
-                self._materialize_batch(number, context)
-                self._reconcile_registered(number, context)
+                if not context.get('registered'):
+                    self._materialize_batch(number, context)
+                    self._reconcile_registered(number, context)
                 unique = {entry.id: entry for entry in context['entries']}
                 status = self._process_movie(number, context['videos'], list(unique.values()), context['root']) if context['videos'] else 'skip'
             except (AuthenticationError, RiskError, Stopped, ScanReadError, CheckpointError):
                 raise
+            except sqlite3.Error as exc:
+                raise CheckpointError('媒体登记提交失败（'+type(exc).__name__+'），已保留未完成位置') from None
             except DirectoryGone as exc:
+                if context.get('registered'):
+                    raise ScanReadError('登记文件的目录不可访问，保留迁移任务') from None
                 self._drop_current_directory(context['directory'], sorted(context['paths']), exc)
                 continue
             except Exception as exc:
@@ -972,12 +1155,57 @@ class LibraryService(PlaybackService):
                 stats[status] += 1
                 outcomes[number] = status
             self._debug(f'刮削结果 番号={number} 状态={status}')
-            self._advance_scan()
+            self.migrations.attempted(number, self._scan_state['cycle_id'])
+            if context.get('registered'):
+                state = deepcopy(self._scan_state)
+                state.update(attempted=sorted(self._attempted), owners=dict(movie_roots))
+                self._commit_scan(state)
+            else:
+                self._advance_scan()
         else:
             self._info(f'已达到单次处理上限 {limit} 部，停止扫描后续目录，剩余影片下次执行')
             if not self._scan_state['done']:
                 stats['scan_pause_reason'] = '达到单次处理上限，进度已保存' if self._progress.enabled else '达到单次处理上限，全量模式下次从头扫描'
         return stats
+
+    def _registered_batch(self, number, context):
+        """Resolve owned file identities without discovering destination subtrees."""
+        movie = self.registry.movie(self.client.account, self.root, number)
+        source_roots, videos, entries = set(), [], []
+        for version in self.registry.versions(self.client.account, self.root, number):
+            for item in version['files']:
+                self._stopped()
+                entry = self.client.info(item['entry']['id'])
+                origin = self.migrations.origin(entry.id)
+                if origin is None:
+                    # Legacy rows have no authorization to an external target.
+                    original_parent = item.get('source_parent', entry.parent_id)
+                    try:
+                        ancestors = self._ancestors(original_parent)
+                    except DirectoryGone:
+                        raise CloudError('旧登记来源无法核验，已跳过：'+entry.name) from None
+                    selected = self._scan_root_ids.intersection(ancestors)
+                    if not selected:
+                        raise CloudError('旧登记来源无法核验，已跳过：'+entry.name)
+                    source = next(cid for cid in ancestors if cid in selected)
+                    source_root = self._scan_archive_roots[source]
+                    self.migrations.record_origin(entry, source_root, ancestors)
+                    origin = self.migrations.origin(entry.id)
+                if not self._origin_allowed(origin):
+                    raise CloudError('来源已从扫描目录移除，冻结迁移：'+entry.name)
+                origin_root = self._origin_root(origin, number)
+                source_roots.add(origin_root)
+                if not self._entry_allowed(entry, number, origin_root):
+                    raise CloudError('已登记文件实际位置无法核验；独立扫描根请选择共同上级或配置统一目标：'+entry.name)
+                if entry.is_dir or (self.extract_number(entry.name) not in (None, number)):
+                    raise CloudError('已登记文件身份或番号变化：'+entry.name)
+                entries.append(entry)
+                if item['kind'] == 'video':
+                    videos.append(entry)
+        if len(source_roots) > 1 and self.archive_loose and self._archive_id is None:
+            raise CloudError('独立扫描根的版本需要配置共同网盘整理目标')
+        context['root'] = next(iter(source_roots), movie['cloud_root'])
+        context.update(videos=videos, entries=entries)
 
     def _render_nfo(self, info, number):
         """Use one deterministic rendering for publication and format upgrades."""
@@ -996,6 +1224,9 @@ class LibraryService(PlaybackService):
     def _scan_summary(self, stats):
         state = getattr(self, '_scan_state', None)
         stats['scan_cycle_complete'] = bool(state and state['done'])
+        stats['library_layout'] = self.policy.layout
+        stats['archive_target'] = self.archive_root or '跟随各扫描归档根'
+        stats['migrated'] = len(self._migrated)
         stats['scan_next_position'] = ('配置扫描根目录（全量从头）' if stats['scan_strategy'] == 'full'
                                        else self._next_position())
         if stats['scan_cycle_complete']:
@@ -1009,6 +1240,7 @@ class LibraryService(PlaybackService):
                      scan_strategy=strategy, scan_resumed=False, scan_cycle_complete=False, scan_pause_reason='')
         self._metadata_cache, self._artwork_cache = {}, {}
         self._refreshed_subtitles, self._attempted = set(), set()
+        self._migrated = set()
         self._scan_state = None
         try:
             self._stopped()

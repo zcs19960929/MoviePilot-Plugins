@@ -10,6 +10,29 @@ import test_metatube_direct as fixtures
 
 
 class HostTests(unittest.TestCase):
+    def test_completed_migrations_refresh_even_if_a_later_movie_hits_risk(self):
+        for version in ('v2','v3'):
+            plugin = load_plugin(version, Mock())
+            plugin.init_plugin({'storage':'115_direct'})
+            globals_ = plugin._MetaTubeScraper__scrape_all.__func__.__globals__
+            error = globals_['RiskError']('verification required')
+            error.stats = dict(migrated=1, ok=1)
+            plugin._direct_service = types.SimpleNamespace(run=Mock(side_effect=error))
+            plugin.save_data = Mock()
+            plugin._MetaTubeScraper__refresh_migrated_library = Mock()
+            plugin._MetaTubeScraper__scrape_all()
+            plugin._MetaTubeScraper__refresh_migrated_library.assert_called_once()
+            self.assertFalse(plugin._running)
+
+    def test_media_server_refresh_failure_is_reported_without_breaking_task_cleanup(self):
+        helper = types.ModuleType('app.helper.mediaserver')
+        helper.MediaServerHelper = Mock(side_effect=RuntimeError('host unavailable'))
+        plugin = load_plugin('v3', Mock())
+        stats = {}
+        with patch.dict('sys.modules', {'app.helper.mediaserver':helper}):
+            plugin._MetaTubeScraper__refresh_migrated_library(stats)
+        self.assertIn('RuntimeError', stats['library_refresh'])
+
     def test_direct_scan_logs_readable_root_and_number_without_extra_cloud_reads(self):
         for version in ("v2", "v3"):
             for labels in ({}, {"id:7": "/影片/新片"}):

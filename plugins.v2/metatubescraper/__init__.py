@@ -27,6 +27,7 @@ import requests
 
 from .direct import PlaybackService, UnknownMedia
 from .library import LibraryService
+from .classification import ClassificationPolicy, DEFAULT_MAKER_GROUPS
 from .cloud115 import Cloud115, CloudError, AuthenticationError, RiskError, Stopped
 from .schedule import build_schedule
 
@@ -328,12 +329,18 @@ JS_PICK_CLOSE = """() => {
   dir_picker_open = false; dir_items = []; pick_dir = null; dir_page = 1;
   dir_loading = false; dir_ready = false; dir_error = '';
 }"""
-JS_PICK_OPEN = "async () => { dir_picker_open = true; await (" + JS_LOAD + ")(); }"
+JS_PICK_OPEN = "async () => { dir_picker_purpose = 'scan'; dir_picker_open = true; await (" + JS_LOAD + ")(); }"
+JS_ARCHIVE_PICK_OPEN = "async () => { dir_picker_purpose = 'archive'; dir_picker_open = true; await (" + JS_LOAD + ")(); }"
 JS_PICK_TOGGLE = "(value) => { if (!value) (" + JS_PICK_CLOSE + ")(); else dir_picker_open = true; }"
 JS_PICK_CONFIRM = """() => {
   if (dir_loading || !dir_ready) {
     if (!dir_error) dir_error = '请先读取目录，再选择当前目录';
     return;
+  }
+  if (dir_picker_purpose === 'archive') {
+    archive_root = String(browse_path || '').trim();
+    archive_root_label = (dir_labels || {})[archive_root] || browse_display_path || archive_root;
+    (""" + JS_PICK_CLOSE + """)(); return;
   }
   if ((""" + JS_ADD + ")()) (" + JS_PICK_CLOSE + ")(); }"
 JS_PICK_NAV = """async (values) => {
@@ -358,7 +365,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.4.0"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -500,6 +507,10 @@ class MetaTubeScraper(_PluginBase):
         self._download_previews = bool(config.get("download_previews"))
         self._rename_files = bool(config.get("rename_files"))
         self._archive_loose = self._storage == "115_direct" and config.get("archive_loose") is True
+        self._library_layout = _pick_str(config.get('library_layout'), 'prefix')
+        self._maker_groups = str(config.get('maker_groups', DEFAULT_MAKER_GROUPS))
+        self._archive_root = _pick_str(config.get('archive_root'))
+        self._cleanup_empty_dirs = config.get('cleanup_empty_dirs', True) is True
         self._numeric_ids = bool(config.get("numeric_ids"))
         self._write_local = bool(config.get("write_local", True))
         self._write_remote = bool(config.get("write_remote"))
@@ -529,6 +540,14 @@ class MetaTubeScraper(_PluginBase):
         if self._storage in _REMOVED_STORAGE:
             errors.append("115Lite 兼容模式已移除，请重新选择存储类型（本地 / u115 / 其他存储）")
         if self._storage == "115_direct":
+            try:
+                ClassificationPolicy(self._library_layout, self._maker_groups)
+            except ValueError as exc:
+                errors.append(str(exc))
+            if self._archive_loose and self._archive_root and not (
+                    re.fullmatch(r'(?:id:)?\d+', self._archive_root) or
+                    (self._archive_root.startswith('/') and not any(part in ('.', '..') for part in self._archive_root.split('/')))):
+                errors.append('网盘整理目标目录需使用绝对路径或 id:目录ID')
             if not self._cookie115:
                 errors.append("请填写 115 Cookie")
             if not self._local_strm_root:
@@ -599,6 +618,8 @@ class MetaTubeScraper(_PluginBase):
                     debug=backend.debug, info=backend.info, error=backend.error,
                     archive_loose=self._archive_loose,
                     numeric_ids=self._numeric_ids,
+                    library_layout=self._library_layout, maker_groups=self._maker_groups,
+                    archive_root=self._archive_root, cleanup_empty_dirs=self._cleanup_empty_dirs,
                 )
             return self._direct_service
 
@@ -1282,6 +1303,8 @@ class MetaTubeScraper(_PluginBase):
                 stats.setdefault("errors", []).append(message)
             self.error(f"刮削任务异常: {e}")
         finally:
+            if stats.get('storage') == '115_direct' and stats.get('migrated'):
+                self.__refresh_migrated_library(stats)
             if task_stop_event.is_set():
                 stats["stopped"] = True
             if stats.get("stopped"):
@@ -1305,6 +1328,29 @@ class MetaTubeScraper(_PluginBase):
     def __run_scheduled(self):
         if self._config_ok and self._schedule:
             self.__scrape_all()
+
+    def __refresh_migrated_library(self, stats):
+        """Ask configured host media servers to rescan after path migrations."""
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+            services = MediaServerHelper().get_services()
+        except ImportError:
+            stats['library_refresh'] = '宿主未提供媒体服务器接口'
+            self.warn(stats['library_refresh'])
+            return
+        except Exception as exc:
+            stats['library_refresh'] = '媒体服务器刷新请求异常（'+type(exc).__name__+'）'
+            self.warn(stats['library_refresh'])
+            return
+        results = []
+        for name, service in services.items():
+            try:
+                result = service.instance.refresh_root_library()
+                results.append(name+('：刷新请求失败' if result is False else '：已请求刷新'))
+            except Exception as exc:
+                results.append(name+'：刷新请求异常（'+type(exc).__name__+'）')
+        stats['library_refresh'] = '；'.join(results) or '未配置媒体服务器'
+        self.info('迁移后媒体库刷新：'+stats['library_refresh'])
 
     # ---------------- 插件契约 ----------------
 
@@ -1471,6 +1517,12 @@ class MetaTubeScraper(_PluginBase):
                 text += " | 下次位置: " + stats.get('scan_next_position', '扫描根目录')
             if stats.get('scan_pause_reason'):
                 text += " | " + stats['scan_pause_reason']
+        if stats.get('library_layout'):
+            text += ' | 媒体库分类: '+('厂商归并' if stats['library_layout'] == 'maker' else '番号前缀')
+            text += ' | 网盘目标: '+stats.get('archive_target', '跟随扫描根')
+            text += ' | 已迁移: '+str(stats.get('migrated', 0))
+        if stats.get('library_refresh'):
+            text += ' | '+stats['library_refresh']
         return schedule_notice + [{
             "component": "VAlert",
             "props": {
@@ -1585,9 +1637,29 @@ class MetaTubeScraper(_PluginBase):
                 }}, md=9, show=legacy),
                 button("选择目录", JS_PICK_OPEN, icon="mdi-folder-open-outline", md=3, size="default")),
             row(switch("archive_loose", "网盘目录和文件按番号整理",
-                       "视频和关联字幕归入前缀／番号目录；已有单番号影片目录也按该层级整理。",
+                       "视频和关联字幕归入所选分类／番号目录。",
                        show=direct)),
-            alert("按番号前缀／番号生成本地媒体库；同番号多个版本共用 NFO 和图片，字幕、分段跟随对应版本。", direct),
+            row(text('archive_root', '网盘整理目标目录', '留空跟随当前扫描归档根',
+                     '留空自动跟随扫描根；指定路径或 id:目录ID 后，多个扫描根可汇总到此处。', md=9,
+                     show=f'{direct} && archive_loose',
+                     **{'onUpdate:modelValue': "(value) => { archive_root = value || ''; archive_root_label = ''; }"}),
+                button('选择整理目录', JS_ARCHIVE_PICK_OPEN, icon='mdi-folder-open-outline', md=3,
+                       show=f'{direct} && archive_loose')),
+            row(text('archive_root_label', '整理目标名称', md=12, readonly=True,
+                     show=f'{direct} && archive_loose && !!archive_root && !!archive_root_label')),
+            row(col({'component':'VSelect', 'props': {
+                'model':'library_layout', 'label':'媒体库分类', 'returnObject':False,
+                'items':[{'title':'番号前缀','value':'prefix'}, {'title':'厂商归并','value':'maker'}],
+                'hint':'修改后按单次上限逐片迁移已登记影片，保留版本编号和播放链接。', 'persistent-hint':True,
+            }}, md=12, show=direct)),
+            row(col({'component':'VTextarea', 'props': {
+                'model':'maker_groups', 'label':'厂商归并规则', 'rows':6,
+                'hint':'每行 目录名=别名1,别名2；优先 maker，空时 label。精确匹配，未匹配归其他厂商，无值归未知厂商。',
+                'persistent-hint':True,
+            }}, md=12, show=f"{direct} && library_layout === 'maker'")),
+            row(switch('cleanup_empty_dirs', '迁移后清理旧空目录',
+                       '仅清理本次迁空的旧影片／分类目录；网盘移入回收站。同目录有其他写入任务时请关闭。', show=direct)),
+            alert("按所选分类／番号生成本地媒体库；同番号多个版本共用 NFO 和图片，字幕、分段跟随对应版本。", direct),
             {"component": "VDialog", "props": {
                 "model": "dir_picker_open", "maxWidth": 800, "width": "calc(100% - 32px)",
                 "scrollable": True, "aria-label": "选择扫描目录", "onUpdate:modelValue": JS_PICK_TOGGLE,
@@ -1634,7 +1706,7 @@ class MetaTubeScraper(_PluginBase):
             ]}]},
             {"component": "VCard", "props": {"variant": "outlined", "class": "mb-2", "show": expr(f"!{local}")}, "content": [
                 {"component": "VCardText", "content": [
-                    alert("固定按番号前缀／番号生成本地媒体库；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
+                    alert("本地媒体库根目录独立于网盘目标；按所选分类／番号生成。同一目录只交给一个插件整理，媒体服务器请读取本地 NFO。", direct),
                     row(switch("write_local", "在本地生成 NFO 和图片", "这里只写元数据，不生成 STRM", show=remote),
                         switch("write_remote", "向网盘写入 NFO 和图片", "需要所选存储支持上传", show=writable)),
                     alert("尚未选择有效输出，请至少启用本地或网盘其中一项。",
@@ -1642,7 +1714,7 @@ class MetaTubeScraper(_PluginBase):
                     row(text("remote_lib_root", "网盘媒体库根目录", "/jav",
                              "用于本地路径映射或自动归位；未开启归位时，影片须已位于此目录内", show=f"{mapped} || {moving}"),
                         text("local_strm_root", "本地媒体库根目录", "/media/strm/jav",
-                             expr(f"{direct} ? '容器内可写的绝对路径，按番号前缀／番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
+                             expr(f"{direct} ? '容器内可写的绝对路径，按所选分类／番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
                     row(switch("organize", "自动归位到网盘媒体库", "需要存储支持移动；仅移动视频，外挂字幕不会跟随", show=writable)),
                 ]},
             ]},
@@ -1699,6 +1771,8 @@ class MetaTubeScraper(_PluginBase):
             "providers": "FANZA,JavBus,MGS,FC2PPVDB,fc2hub", "storage": "115_direct",
             "cookie115": "", "playback_base_url": "", "cloud_interval": 5,
             "archive_loose": False,
+            'library_layout':'prefix', 'maker_groups':DEFAULT_MAKER_GROUPS, 'archive_root':'',
+            'archive_root_label':'', 'cleanup_empty_dirs':True, 'dir_picker_purpose':'scan',
             "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,

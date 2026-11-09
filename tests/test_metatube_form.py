@@ -16,6 +16,35 @@ HERE = Path(__file__).parent
 
 @unittest.skipUnless(NODE, 'Node.js is required for form expression tests')
 class FormTests(unittest.TestCase):
+    def test_maker_and_archive_settings_are_conditional_and_keep_follow_default(self):
+        for version in ('v2', 'v3'):
+            result = self.render(version)
+            self.assertEqual(result['model']['library_layout'], 'prefix')
+            self.assertEqual(result['model']['archive_root'], '')
+            self.assertTrue(result['model']['cleanup_empty_dirs'])
+            self.assertNotIn('archive_root', result['snapshots'][0])
+            self.assertNotIn('maker_groups', result['snapshots'][0])
+            changed = self.render(version, changes=[{'field':'archive_loose','value':True},
+                {'field':'library_layout','value':'maker'}])
+            self.assertIn('archive_root', changed['snapshots'][-1])
+            self.assertIn('maker_groups', changed['snapshots'][-1])
+            self.assertIn('S1', changed['model']['maker_groups'])
+            for storage in ('local','u115'):
+                fields = self.render(version, storage=storage, archive_loose=True, library_layout='maker')['snapshots'][0]
+                self.assertNotIn('library_layout', fields)
+                self.assertNotIn('archive_root', fields)
+
+    def test_archive_picker_is_single_and_cancel_preserves_both_settings(self):
+        for version in ('v2','v3'):
+            for cancel in (False, True):
+                result = self.render(version, scan_dirs='id:9', archive_root='id:88',
+                                     archive_picker_flow={'cancel':cancel})
+                self.assertEqual(result['model']['scan_dirs'], 'id:9')
+                self.assertEqual(result['model']['archive_root'], 'id:88' if cancel else 'id:7')
+            late = self.render(version, scan_dirs='id:9', archive_root='',
+                               archive_picker_flow={'cancelPending':True})
+            self.assertEqual(late['model']['archive_root'], '')
+
     def test_scan_strategy_is_direct_only_and_depth_keeps_its_saved_key(self):
         for version in ('v2', 'v3'):
             for storage in ('115_direct', {'value':'115_direct'}):
@@ -37,9 +66,10 @@ class FormTests(unittest.TestCase):
         directory_flow = values.pop('directory_flow', None)
         directory_failure = values.pop('directory_failure', None)
         picker_flow = values.pop('picker_flow', None)
+        archive_picker_flow = values.pop('archive_picker_flow', None)
         model.update(values)
         reply = subprocess.run([NODE, str(HERE / 'form_model.js')],
-                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check, directoryFlow=directory_flow, directoryFailure=directory_failure, pickerFlow=picker_flow)),
+                               input=json.dumps(dict(form=form, model=model, changes=changes, asyncBrowse=async_browse, cookieCheck=cookie_check, directoryFlow=directory_flow, directoryFailure=directory_failure, pickerFlow=picker_flow, archivePickerFlow=archive_picker_flow)),
                                capture_output=True, text=True, check=True)
         return json.loads(reply.stdout)
 

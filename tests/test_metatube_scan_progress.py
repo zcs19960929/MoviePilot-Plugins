@@ -225,7 +225,9 @@ class ScanProgressTests(unittest.TestCase):
         roots = ['/jav/IPX-201 incoming', 'id:9']
         cloud.resolve_folder = lambda value: '8' if value == roots[0] else '9'
         service.run(roots, limit=1, scan_strategy='incremental')
-        self.assertEqual(cloud.entries['8'].name, 'IPX-201')
+        # A selected source root is retained, including its name and identity.
+        self.assertEqual(cloud.entries['8'].name, 'IPX-201 incoming')
+        self.assertEqual(cloud.entries['8'].parent_id, '7')
         service = self.restart(service)
         cloud.resolve_folder = Mock(side_effect=AssertionError('old path must not be resolved'))
         result = service.run(roots, limit=1, scan_strategy='incremental')

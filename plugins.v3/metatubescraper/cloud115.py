@@ -291,13 +291,43 @@ class Cloud115:
         self._call("fs_rename", (str(fid), name))
 
     def mkdir(self, name, parent_id):
-        if name != "数字番号" and not re.fullmatch(r"[A-Z0-9][A-Z0-9-]*", name):
-            raise CloudError("归档目录名称无效")
+        from .classification import directory_name
+        try:
+            if directory_name(name) != name:
+                raise ValueError()
+        except ValueError:
+            raise CloudError("归档目录名称无效") from None
         result = self._call("fs_mkdir", {"cname": name, "pid": str(parent_id)})
         cid = str(result.get("cid") or result.get("file_id") or "")
         if not cid.isdecimal() or cid in ("0", str(parent_id)):
             raise CloudError("115 未返回有效的归档目录 ID")
         return cid
+
+    def recycle_empty_directory(self, cid, parent_id, name, protected=()):
+        """Recycle only a revalidated empty candidate; SDK has no atomic rmdir.
+
+        The caller must ensure there are no other writers in these directories.
+        Never call a recycle-bin purge API, including on an uncertain response.
+        """
+        cid, parent_id = str(cid), str(parent_id)
+        if not cid.isdecimal() or cid in {'0', parent_id, *map(str, protected)}:
+            raise CloudError('禁止清理受保护的网盘目录')
+        with self._lock:
+            for _ in range(2):
+                try:
+                    entry = self.info(cid)
+                except NotFoundError:
+                    return True
+                if not entry.is_dir or entry.parent_id != parent_id or entry.name != name:
+                    raise CloudError('旧目录身份已变化，停止清理')
+                if self.listdir(cid):
+                    return False
+            self._call('fs_delete', cid)
+            try:
+                self.info(cid)
+            except NotFoundError:
+                return True
+            raise CloudError('旧目录移入回收站的结果尚未确认')
 
     def move(self, file_ids, parent_id):
         if not file_ids or not str(parent_id).isdecimal() or str(parent_id) == "0":

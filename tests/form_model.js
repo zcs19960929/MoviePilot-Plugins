@@ -1,6 +1,6 @@
 // Exercise the plugin schema using the host FormRender's expression/event contract.
 const fs = require('node:fs');
-const { form, model, changes = [], asyncBrowse, cookieCheck, directoryFlow, directoryFailure, pickerFlow } = JSON.parse(fs.readFileSync(0, 'utf8'));
+const { form, model, changes = [], asyncBrowse, cookieCheck, directoryFlow, directoryFailure, pickerFlow, archivePickerFlow } = JSON.parse(fs.readFileSync(0, 'utf8'));
 const expression = value => typeof value === 'string' && value.startsWith('{{') && value.endsWith('}}');
 const evaluate = value => expression(value)
   ? new Function('model', `with(model) { return ${value.slice(2, -2)} }`)(model)
@@ -52,20 +52,21 @@ for (const { field, value } of changes) {
   snapshots.push(visit(form));
 }
 let intermediate;
-if(pickerFlow) {
+if(pickerFlow || archivePickerFlow) {
+  const flow=archivePickerFlow || pickerFlow;
   const pending=[];
   global.window={MoviePilotAPI:Object.fromEntries(['get','post'].map(method=>[method,()=>new Promise((resolve,reject)=>pending.push({resolve,reject}))]))};
-  const open=execute(button(form,'选择目录').props.onClick);
+  const open=execute(button(form,archivePickerFlow?'选择整理目录':'选择目录').props.onClick);
   intermediate={loading:model.dir_loading,unchanged:model.scan_dirs};
-  if(pickerFlow.cancelPending) {
-    if(pickerFlow.dismiss) execute(find(form,'dir_picker_open').props['onUpdate:modelValue'],false);
+  if(flow.cancelPending) {
+    if(flow.dismiss) execute(find(form,'dir_picker_open').props['onUpdate:modelValue'],false);
     else execute(button(form,'取消').props.onClick);
     pending.shift().resolve({code:0,path:'id:9',parent:'id:0',display_path:'/迟到目录',data:[]});
     await open;
   } else {
     pending.shift().resolve({code:0,path:'id:7',parent:'id:0',display_path:'/电影',data:[]});
     await open;snapshots.push(visit(form));
-    if(pickerFlow.cancel)execute(button(form,'取消').props.onClick);
+    if(flow.cancel)execute(button(form,'取消').props.onClick);
     else execute(button(form,'选择当前目录').props.onClick);
   }
   snapshots.push(visit(form));
