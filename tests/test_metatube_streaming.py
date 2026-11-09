@@ -33,7 +33,7 @@ class StreamingTests(unittest.TestCase):
         def listing(cid):
             if cid == '9':
                 observations.append((
-                    (service.root/'IPX/IPX-201/IPX-201 - V0001.strm').is_file(),
+                    (service.root/'IPX/IPX-201/IPX-201.strm').is_file(),
                     cloud.entries[cloud.entries['8'].parent_id].name,
                 ))
             return original(cid)
@@ -68,7 +68,7 @@ class StreamingTests(unittest.TestCase):
         cloud.entries['2'] = m.Entry('2', '9', 'IPX-202.mp4', pickcode='b'*17)
         result = service.run(['7'], limit=1)
         self.assertEqual((result['total'], result['ok'], result['skip']), (2, 1, 1))
-        self.assertTrue((service.root/'IPX/IPX-202/IPX-202 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-202/IPX-202.strm').is_file())
 
     def test_notfound_is_cached_and_counted_once_across_batches(self):
         _, cloud, metadata, service = self.library([
@@ -94,7 +94,7 @@ class StreamingTests(unittest.TestCase):
             dict(id='2', parent_id='9', name='IPX-201-other.mkv', pickcode='b'*17),
         ], archive=False)
         self.assertEqual(service.run(['7'])['ok'], 1)
-        second = service.root/'IPX/IPX-201/IPX-201 - V0002.strm'
+        second = service.root/'IPX/IPX-201/IPX-201 - V0001.strm'
         original_link = second.read_bytes()
         second.unlink()
         result = service.run(['7'])
@@ -116,14 +116,14 @@ class StreamingTests(unittest.TestCase):
         result = service.run(['7'])
         movie = service.root/'IPX/IPX-201'
         self.assertEqual(sorted(p.name for p in movie.glob('*.strm')),
-                         ['IPX-201 - V0001.strm', 'IPX-201 - V0002.strm'])
+                         ['IPX-201 - V0001.strm', 'IPX-201.strm'])
         self.assertEqual(cloud.entries['1'].parent_id, '10')
         self.assertEqual(cloud.entries['2'].parent_id, '10')
         self.assertEqual(result['total'], 1)
         self.assertEqual(result['ok'], 1)
         self.assertEqual(metadata.call_count, 1)
         self.assertEqual(service.artwork.call_count, 2)
-        self.assertEqual([fid for fid, _ in cloud.renames].count('1'), 1)
+        self.assertEqual([fid for fid, _ in cloud.renames].count('1'), 0)  # Already has its final plain name.
 
     def test_new_subtitle_uses_already_processed_video_as_anchor(self):
         m, cloud, _, service = self.library([
@@ -141,7 +141,7 @@ class StreamingTests(unittest.TestCase):
         cloud.listdir = listing
         result = service.run(['7'])
         self.assertEqual(result['fail'], 0)
-        self.assertEqual((service.root/'IPX/IPX-201/IPX-201 - V0001.zh.ass').read_bytes(), b'subtitle:3')
+        self.assertEqual((service.root/'IPX/IPX-201/IPX-201.zh.ass').read_bytes(), b'subtitle:3')
         files = service.registry.versions(cloud.account, service.root, 'IPX-201')[0]['files']
         self.assertEqual({item['entry']['id'] for item in files}, {'1', '3'})
 
@@ -154,7 +154,7 @@ class StreamingTests(unittest.TestCase):
             dict(id='12', parent_id='11', name='IPX-201', is_dir=True),
         ])
         self.assertEqual(service.run(['7'])['ok'], 1)
-        original_link = (service.root/'IPX/IPX-201/IPX-201 - V0001-CD1.strm').read_bytes()
+        original_link = (service.root/'IPX/IPX-201/IPX-201-CD1.strm').read_bytes()
         # A new upload recreates the old incoming directory after empty cleanup.
         cloud.entries['8'] = m.Entry('8', '7', 'IPX-201', is_dir=True)
         cloud.entries['2'] = m.Entry('2', '8', 'IPX-201-CD2.mp4', pickcode='b'*17)
@@ -163,8 +163,8 @@ class StreamingTests(unittest.TestCase):
         files = service.registry.versions(cloud.account, service.root, 'IPX-201')[0]['files']
         self.assertEqual({item['entry']['id'] for item in files}, {'1', '2'})
         self.assertEqual(sorted(p.name for p in (service.root/'IPX/IPX-201').glob('*.strm')),
-                         ['IPX-201 - V0001-CD1.strm', 'IPX-201 - V0001-CD2.strm'])
-        self.assertEqual((service.root/'IPX/IPX-201/IPX-201 - V0001-CD1.strm').read_bytes(), original_link)
+                         ['IPX-201-CD1.strm', 'IPX-201-CD2.strm'])
+        self.assertEqual((service.root/'IPX/IPX-201/IPX-201-CD1.strm').read_bytes(), original_link)
 
     def test_later_failed_batch_dominates_success_without_double_counting_movie(self):
         _, cloud, _, service = self.library([
@@ -176,7 +176,7 @@ class StreamingTests(unittest.TestCase):
         ], archive=False)
         cloud.fail_rename = '2'
         result = service.run(['7'])
-        self.assertTrue((service.root/'IPX/IPX-201/IPX-201 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-201/IPX-201.strm').is_file())
         self.assertEqual((result['total'], result['ok'], result['fail']), (1, 0, 1))
 
     def test_overlapping_selected_roots_share_parent_archive_scope(self):
@@ -226,7 +226,7 @@ class StreamingTests(unittest.TestCase):
                     cloud.entries['11'] = m.Entry('11', '9', 'IPX-999', is_dir=True)
                 service.run(['7'])
                 self.assertEqual(cloud.entries['1'].name,
-                                 'IPX-201 - V0001-CD1.mp4' if classified else 'IPX-201-CD1.mp4')
+                                 'IPX-201-CD1.mp4' if classified else 'IPX-201-CD1.mp4')
 
     def test_recovery_does_not_merge_parts_from_independent_archive_roots(self):
         _, cloud, _, service = self.library([
@@ -264,7 +264,7 @@ class StreamingTests(unittest.TestCase):
         result = service.run(['0'])
         self.assertEqual(result['ok'], 1)
         self.assertEqual(pages[:2], [0, 500])
-        self.assertEqual((service.root/'IPX/IPX-201/IPX-201 - V0001.zh.ass').read_bytes(), b'subtitle:2')
+        self.assertEqual((service.root/'IPX/IPX-201/IPX-201.zh.ass').read_bytes(), b'subtitle:2')
 
 
 if __name__ == '__main__':

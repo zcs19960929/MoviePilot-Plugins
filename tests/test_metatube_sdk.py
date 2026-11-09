@@ -83,7 +83,7 @@ class PlaybackHTTPTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = fixture.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
             plugin = load_plugin("v3", Mock())
             plugin.init_plugin({"storage": "115_direct", "enabled": False})
             playback = plugin._MetaTubeScraper__get_playback_service.__globals__["PlaybackService"](cloud, Path(directory)/"state")

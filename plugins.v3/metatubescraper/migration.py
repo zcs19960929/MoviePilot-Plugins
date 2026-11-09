@@ -206,6 +206,8 @@ class MigrationManager:
                     cloud_cleanup=previous.get('cloud_cleanup', []) if unfinished else [],
                     cloud_targets=previous.get('cloud_targets', []) if previous else [],
                     cloud_files=previous.get('cloud_files', []) if previous else [])
+        if previous and 'naming' in previous:
+            plan['naming'] = previous['naming']
         self.save(number, plan)
         with self.registry._lock, self.registry.db:
             self.registry.check_identity()

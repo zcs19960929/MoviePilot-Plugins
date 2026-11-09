@@ -19,6 +19,7 @@ from .direct import PlaybackService, Registry, SUBTITLE_EXTS, VIDEO_EXTS, _part,
 from .scan_progress import CheckpointError, ScanProgress
 from .classification import ClassificationPolicy, directory_name
 from .migration import MigrationManager
+from .naming import NamingManager, REVISION as NAMING_REVISION
 
 
 class ScanReadError(CloudError):
@@ -214,6 +215,7 @@ class LibraryService(PlaybackService):
         self._metadata_cache, self._artwork_cache = {}, {}
         self._refreshed_subtitles = set()
         self.migrations = MigrationManager(self)
+        self.naming = NamingManager(self)
         self._registered_categories = self.migrations.categories()
 
     def _stopped(self):
@@ -250,6 +252,12 @@ class LibraryService(PlaybackService):
         checked_path(self.root, folder/'movie.nfo')
         folder.mkdir(parents=True, exist_ok=True)
         return folder
+
+    def _checked_name(self, path):
+        checked_path(self.root, path)
+
+    def _version_owner(self, number, version):
+        return version_job(self.root, number, version)
 
     def _relative(self, number):
         if number in self._relatives:
@@ -479,8 +487,20 @@ class LibraryService(PlaybackService):
             return 'notfound'
         relative = movie_relative(number, self.policy.category(number, info))
         self._relatives[number] = relative
+        previous_naming = self.naming.job(number) or {}
+        normal_retry = previous_naming and not previous_naming.get('requires_archive',True) and any(
+            item['phase'] != 'done' for item in previous_naming['cloud'])
+        cloud_names = self.archive_loose or normal_retry or not (
+            self._registered_migration or self.naming.needs(number) or previous_naming.get('cloud_deferred'))
+        recovered = self.naming.recover(number, False)
+        if recovered:
+            videos = [self.client.info(e.id) for e in videos]
+            entries = [self.client.info(e.id) for e in entries]
+        videos = [self.naming.pending_entry(number,e) for e in videos]
+        entries = [self.naming.pending_entry(number,e) for e in entries]
         plans = self._plans(number, videos, entries)
         self._remember_origins(plans, cloud_root)
+        plans, renamed = self.naming.apply(number, plans, cloud_root, cloud_names)
         owners = {movie_job(self.root, number)} | {version_job(self.root, number, version['version'])
                                                 for version in self.registry.versions(account, self.root, number)}
         relocated = self.migrations.relocate_local(number, relative, owners)
@@ -498,7 +518,7 @@ class LibraryService(PlaybackService):
             if not shared[name]:
                 raise CloudError('图片下载失败：' + name)
         data = []
-        changed = relocated
+        changed = relocated or recovered or renamed
         for version, files in plans.items():
             owner = version_job(self.root, number, version)
             self.registry.save_version(account, self.root, number, version, files)
@@ -519,7 +539,7 @@ class LibraryService(PlaybackService):
                 if not content:
                     raise CloudError('字幕下载结果为空：' + name)
                 data.append((folder/name, content, owner))
-                changed = changed or old != content or entry.name != item['target']
+                changed = changed or old != content or (cloud_names and entry.name != item['target'])
         for name, content in shared.items():
             old = self.registry.owned_bytes(folder/name, account, shared_owner)
             changed = changed or old != content
@@ -537,11 +557,17 @@ class LibraryService(PlaybackService):
                     file.flush()
                     os.fsync(file.fileno())
                 staged[path] = stage
+            cloud_renamed = self.naming.recover(number, cloud_names)
+            changed = changed or cloud_renamed
+            if cloud_renamed:
+                for files in plans.values():
+                    for item in files:
+                        item['entry'] = asdict(self.client.info(item['entry']['id']))
             for version, files in plans.items():
                 for item in files:
                     self._stopped()
                     entry = self.client.info(item['entry']['id'])
-                    if entry.name != item['target'] and (self.archive_loose or not self._registered_migration):
+                    if entry.name != item['target'] and cloud_names:
                         original = Entry(**item['entry'])
                         if entry.name != original.name or entry.parent_id != original.parent_id:
                             raise CloudError('文件状态在执行前变化：' + entry.name)
@@ -571,7 +597,7 @@ class LibraryService(PlaybackService):
         for version, files in plans.items():
             self.registry.save_version(account, self.root, number, version, files, complete=True)
         refresh_needed = self.migrations.finish(number, self._policy_signature)
-        if refresh_needed or relocated or (movie and archive_changed):
+        if refresh_needed or relocated or (movie and (archive_changed or recovered or renamed)):
             self._migrated.add(number)
         self._registered_categories.add(Path(relative).parts[0])
         return 'ok' if changed else 'skip'
@@ -733,7 +759,7 @@ class LibraryService(PlaybackService):
         scope = dict(account=self.client.account, plugin_id=self.plugin_id, roots=list(roots),
                      recursive=recursive, max_depth=max_depth, output_root=str(self.root),
                      archive=self.archive_loose, numeric_ids=self.numeric_ids,
-                     classification=self.policy.signature, archive_root=self.archive_root)
+                     classification=self.policy.signature, archive_root=self.archive_root, naming_revision=NAMING_REVISION)
         signature = digest(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode())
         self._progress = ScanProgress(self.registry, signature, strategy == 'incremental', self._info)
         state = self._progress.load() if strategy == 'incremental' else None
@@ -776,7 +802,7 @@ class LibraryService(PlaybackService):
         state.setdefault('cycle_id', secrets.token_hex(16))
         self._policy_signature = digest(json.dumps(dict(policy=self.policy.signature,
             archive=self.archive_loose, target=self._archive_id,
-            roots=state['archive_roots']), sort_keys=True).encode())
+            roots=state['archive_roots'], naming_revision=NAMING_REVISION), sort_keys=True).encode())
         self._attempted = set(state['attempted'])
         self._cycle_movie_roots = dict(state['owners'])
         self._current_entries = None
@@ -1008,9 +1034,9 @@ class LibraryService(PlaybackService):
                     raise CloudError('待处理文件已移出配置扫描范围：'+entry.name)
             if fid in context['video_ids']:
                 actual = self.extract_number(entry.name)
-                if actual and actual != number:
+                if actual and actual != number and not self.naming.is_pending(number,entry):
                     raise CloudError('待处理视频名称指向其他番号：'+entry.name)
-                if not actual and self.extract_number(self._current_folder_name) != number:
+                if not actual and self.extract_number(self._current_folder_name) != number and not self.naming.is_pending(number,entry):
                     raise ScanReadError('快照目录的番号已变化，已保留位置，请执行全量扫描重新识别')
                 context['videos'].append(entry)
             context['entries'].append(entry)
@@ -1087,7 +1113,7 @@ class LibraryService(PlaybackService):
                     self._error(f"历史登记文件位于扫描范围外 番号={number} 原文件名={entry.name!r} 文件ID={fid} 当前父目录={entry.parent_id}")
                     continue
                 actual_number = self.extract_number(entry.name)
-                if actual_number and actual_number != number:
+                if actual_number and actual_number != number and not self.naming.is_pending(number,entry):
                     raise CloudError('已登记视频名称指向其他番号：' + entry.name)
                 if item['kind'] == 'video':
                     context['videos'].append(entry)
@@ -1097,7 +1123,8 @@ class LibraryService(PlaybackService):
     def _run(self, limit, stats):
         def work():
             for number in list(self.migrations.numbers(self._policy_signature, self._scan_state['cycle_id'])):
-                if (self.policy.layout == 'prefix' and not self.archive_root and not self.migrations.plan(number)):
+                if (self.policy.layout == 'prefix' and not self.archive_root and not self.migrations.plan(number)
+                        and not self.naming.needs(number)):
                     continue
                 yield number, dict(registered=True, videos=[], entries=[], paths={'登记库迁移任务'}, root=None)
             yield from self._scan(stats)
@@ -1113,7 +1140,7 @@ class LibraryService(PlaybackService):
             self._info(f'开始处理影片 番号={number} 来源={sorted(context["paths"])!r}')
             plan = self.migrations.plan(number) or {}
             self._registered_migration = bool(context.get('registered') and
-                (self.policy.layout == 'maker' or self.archive_root or plan.get('local_cleanup')))
+                (self.policy.layout == 'maker' or self.archive_root or plan.get('local_cleanup') or self.naming.needs(number)))
             try:
                 if context.get('registered'):
                     self._registered_batch(number, context)
@@ -1125,7 +1152,12 @@ class LibraryService(PlaybackService):
                     self._reconcile_registered(number, context)
                 unique = {entry.id: entry for entry in context['entries']}
                 status = self._process_movie(number, context['videos'], list(unique.values()), context['root']) if context['videos'] else 'skip'
-            except (AuthenticationError, RiskError, Stopped, ScanReadError, CheckpointError):
+            except CheckpointError:
+                previous = outcomes.get(number)
+                if previous is not None:
+                    stats[previous] -= 1
+                raise
+            except (AuthenticationError, RiskError, Stopped, ScanReadError):
                 raise
             except sqlite3.Error as exc:
                 raise CheckpointError('媒体登记提交失败（'+type(exc).__name__+'），已保留未完成位置') from None
@@ -1197,7 +1229,7 @@ class LibraryService(PlaybackService):
                 source_roots.add(origin_root)
                 if not self._entry_allowed(entry, number, origin_root):
                     raise CloudError('已登记文件实际位置无法核验；独立扫描根请选择共同上级或配置统一目标：'+entry.name)
-                if entry.is_dir or (self.extract_number(entry.name) not in (None, number)):
+                if entry.is_dir or (self.extract_number(entry.name) not in (None, number) and not self.naming.is_pending(number,entry)):
                     raise CloudError('已登记文件身份或番号变化：'+entry.name)
                 entries.append(entry)
                 if item['kind'] == 'video':

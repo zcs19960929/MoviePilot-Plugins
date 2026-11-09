@@ -67,7 +67,7 @@ class PlaybackRegistryTests(unittest.TestCase):
             m, cloud, metadata, service = fixture.make(tmp)
             service.plugin_id = 'MetaTubeScraper_Clone1'
             self.assertEqual(service.run(['0'])['ok'], 1)
-            url = (Path(tmp)/'library/DSOD/DSOD-060/DSOD-060 - V0001.strm').read_text()
+            url = (Path(tmp)/'library/DSOD/DSOD-060/DSOD-060.strm').read_text()
             self.assertIn('/plugin/MetaTubeScraper_Clone1/redirect_url?', url)
 
     def test_playback_missing_database_returns_503_without_creating_files(self):

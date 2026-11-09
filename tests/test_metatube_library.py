@@ -34,8 +34,8 @@ class LibraryAcceptanceTests(unittest.TestCase):
             self.assertEqual(result['fail'], 1)
             self.assertIn('共同上级', ' '.join(result['errors']))
             self.assertEqual(cloud.moves, [(['1'], '10')])
-            self.assertEqual(cloud.renames, [('1', 'IPX-922 - V0001.mp4')])
-            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0001.strm').is_file())
+            self.assertEqual(cloud.renames, [('1', 'IPX-922.mp4')])
+            self.assertTrue((service.root/'IPX/IPX-922/IPX-922.strm').is_file())
             self.assertEqual(cloud.entries['2'].name, 'IPX-922-B.mkv')
 
     def make(self, directory, entries, archive=False):
@@ -62,7 +62,7 @@ class LibraryAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.run(['7'])['ok'],1)
             movie = Path(folder)/'library/IPX/IPX-922'
             self.assertEqual(sorted(p.name for p in movie.glob('*.strm')),
-                ['IPX-922 - V0001.strm','IPX-922 - V0002.strm'])
+                ['IPX-922 - V0001.strm','IPX-922.strm'])
             self.assertEqual(metadata.call_count,1)
             tokens = {p.name:p.read_bytes() for p in movie.glob('*.strm')}
             self.assertEqual(service.run(['7'])['skip'],1)
@@ -114,7 +114,7 @@ class LibraryAcceptanceTests(unittest.TestCase):
             cloud.entries['2']=m.Entry('2','0','IPX-922-A-CD2.mp4',pickcode='b'*17)
             self.assertEqual(service.run(['0'])['ok'],1)
             files=list((service.root/'IPX/IPX-922').glob('*.strm'))
-            self.assertEqual(sorted(p.name for p in files),['IPX-922 - V0001-CD1.strm','IPX-922 - V0001-CD2.strm'])
+            self.assertEqual(sorted(p.name for p in files),['IPX-922-CD1.strm','IPX-922-CD2.strm'])
 
     def test_subtitle_same_basename_is_bound_to_source_parent(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -128,8 +128,8 @@ class LibraryAcceptanceTests(unittest.TestCase):
                 dict(id='4',parent_id='9',name='IPX-922.zh.ass',pickcode='d'*17),
             ])
             self.assertEqual(service.run(['7'])['ok'],1)
-            self.assertEqual((service.root/'IPX/IPX-922/IPX-922 - V0001.zh.ass').read_bytes(),b'subtitle:3')
-            self.assertEqual((service.root/'IPX/IPX-922/IPX-922 - V0002.zh.ass').read_bytes(),b'subtitle:4')
+            self.assertEqual((service.root/'IPX/IPX-922/IPX-922.zh.ass').read_bytes(),b'subtitle:3')
+            self.assertEqual((service.root/'IPX/IPX-922/IPX-922 - V0001.zh.ass').read_bytes(),b'subtitle:4')
 
     def test_ambiguous_subtitle_stops_before_any_cloud_rename(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -191,7 +191,7 @@ class LibraryAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.run(['0'])['ok'],1)
             cloud.entries['2']=m.Entry('2','0','www.98T.la@IPX-922-U.zh.ass',pickcode='b'*17)
             self.assertEqual(service.run(['0'])['ok'],1)
-            self.assertEqual((service.root/'IPX/IPX-922/IPX-922 - V0001.zh.ass').read_bytes(),b'subtitle:2')
+            self.assertEqual((service.root/'IPX/IPX-922/IPX-922.zh.ass').read_bytes(),b'subtitle:2')
 
     def test_generic_subtitle_uses_single_video_in_its_parent(self):
         with tempfile.TemporaryDirectory() as folder:
@@ -203,8 +203,8 @@ class LibraryAcceptanceTests(unittest.TestCase):
                 dict(id='3',parent_id='8',name='zh.ass',pickcode='c'*17),
             ])
             self.assertEqual(service.run(['7'])['ok'],1)
-            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0002.zh.ass').exists())
-            self.assertFalse((service.root/'IPX/IPX-922/IPX-922 - V0001.zh.ass').exists())
+            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0001.zh.ass').exists())
+            self.assertFalse((service.root/'IPX/IPX-922/IPX-922.zh.ass').exists())
 
     def test_simultaneous_registration_keeps_one_version_per_file(self):
         import concurrent.futures
@@ -277,7 +277,7 @@ class LibraryAcceptanceTests(unittest.TestCase):
             self.assertEqual(service.run(['0'])['ok'],1)
             output=service.root/'IPX/IPX-922'
             self.assertEqual({path.name for path in output.iterdir()},
-                {'IPX-922 - V0001.strm','IPX-922 - V0001.zh.ass','movie.nfo','poster.jpg','fanart.jpg'})
+                {'IPX-922.strm','IPX-922.zh.ass','movie.nfo','poster.jpg','fanart.jpg'})
             self.assertEqual(metadata.call_count,1)
             self.assertFalse(any(call.args==('1',) for call in cloud.info.call_args_list))
             self.assertEqual(service.run(['0'])['skip'],1)
@@ -288,14 +288,14 @@ class LibraryAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             m,cloud,_,service=self.make(folder,[dict(id='1',parent_id='0',name='IPX-922.mp4',pickcode='a'*17)])
             self.assertEqual(service.run(['0'])['ok'],1)
-            token=(service.root/'IPX/IPX-922/IPX-922 - V0001.strm').read_text().strip().split('media_id=')[1]
+            token=(service.root/'IPX/IPX-922/IPX-922.strm').read_text().strip().split('media_id=')[1]
             shutil.rmtree(service.root/'IPX/IPX-922')
             del cloud.entries['1']
             cloud.entries['2']=m.Entry('2','0','IPX-922-U.mp4',pickcode='b'*17)
             cloud.info=Mock(wraps=cloud.info)
             self.assertEqual(service.run(['0'])['ok'],1)
-            self.assertFalse((service.root/'IPX/IPX-922/IPX-922 - V0001.strm').exists())
-            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0002.strm').exists())
+            self.assertFalse((service.root/'IPX/IPX-922/IPX-922.strm').exists())
+            self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0001.strm').exists())
             self.assertEqual(service.registry.media(cloud.account,token).id,'1')
             self.assertFalse(any(call.args==('1',) for call in cloud.info.call_args_list))
 
