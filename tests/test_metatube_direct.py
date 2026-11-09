@@ -1,4 +1,4 @@
-"""Offline acceptance tests: no MoviePilot, 115Lite, Cookie or network required."""
+"""Offline acceptance tests: no MoviePilot, Cookie or network required."""
 import dataclasses
 import importlib.util
 import json

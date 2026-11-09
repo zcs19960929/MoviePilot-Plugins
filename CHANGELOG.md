@@ -1,12 +1,12 @@
 # 更新记录
 
-## 115Lite 上游镜像 3.0.3
+## 1.3.0
 
-- 同步 madrays/MoviePilot-Plugins 固定提交 `5e3f834437eb062658861216ad4c34d140a4c05a` 的 115Lite，保留原作者、版本、插件 ID、配置前缀及更新历史。
-- 包含后端、Vue 前端源码与编译资源、迁移脚本和上游测试；发布包额外包含 CPython 3.14 / Linux glibc x86_64 的三个 Rust wheel 及许可证、NOTICE、来源记录。
-- 共用 `p115client==0.0.9.6.5.1`、`python-concurrenttools==0.1.8`；MetaTube 仍为 1.1.5，源码、依赖及 V2 清单不变。
-- 新增默认只读的手动同步工具和 GitHub Actions 检查、待审核 PR、独立手动发布入口；不定时同步、不自动合并、不覆盖已发布的同版本包。
-- 两款插件的 Cookie 分别保存。同一网盘目录不要同时启用多个整理任务，本地输出目录应分开。
+- **移除 115Lite 插件**：删除 `plugins.v3/p115lite`、`frontend/p115lite`、上游来源记录、同步脚本、CI 工作流及其测试，仓库只保留 MetaTube 番号刮削。
+- **移除 MetaTube 的 115Lite 兼容模式**：存储类型不再提供 `115Lite`，`trigger_strm`（刮完通知 115Lite 生成 STRM）开关及相关事件通知代码一并删除。
+- 已保存 `storage=115Lite` 的旧配置不会被静默改写：任务启动前直接返回 400 并提示重新选择存储类型，配置值原样保留便于核对。
+- 其余存储模式（`115_direct` / `local` / `u115` / 其他存储名）行为不变；115 Cookie 直连仍独立生成 STRM、字幕、NFO 和图片。
+- V2、V3 同步升级至 1.3.0。已生成的本地 STRM、NFO、字幕与播放登记不受影响。
 
 ## 1.2.2
 

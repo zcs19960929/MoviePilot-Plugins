@@ -1,12 +1,13 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.2.2",
+    "version": "1.3.0",
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
     "v3": true,
     "history": {
+      "v1.3.0": "移除 115Lite 插件与 MetaTube 的 115Lite 兼容模式存储；旧配置启动时提示重新选择存储类型，其余模式与直连 STRM 生成不变。",
       "v1.2.2": "增量扫描遇到已删除或已进回收站的目录时跳过并继续，不再永久停在同一条 800001 错误；115 返回目录不存在时保留原始提示并重试一次。",
       "v1.2.1": "115 直连逐目录即时刮削和整理，新增全量／增量扫描；增量保存扫描位置并跨任务、重启续扫，保留同番号多版本、分段字幕及稳定播放链接。",
       "v1.2.0": "115 直连固定按番号前缀分类，同番号多版本独立生成 STRM 和字幕、共享 NFO 与图片；保留正常断点续跑与冲突明细，移除旧布局迁移及登记补救工具。",
@@ -22,22 +23,5 @@
       "v1.1.0": "新增 115 Cookie 独立访问、视频字幕关联改名、本地 STRM/字幕/NFO/图片生成、SQLite 续跑及稳定 302 播放入口；直连模式要求 Python 3.12+。",
       "v1.0.1": "修复数据源自检漏传 Token 导致全部 401，保留 HTTP 状态和错误详情，明确先保存再测试。"
     }
-  },
-  "P115Lite": {
-    "name": "115Lite",
-    "description": "115Lite 自用版，感谢原作者 DDSRem、zkmydgth",
-    "labels": "115,云盘,STRM,整理",
-    "version": "3.0.3",
-    "icon": "https://raw.githubusercontent.com/madrays/MoviePilot-Plugins/main/icons/p115lite.png",
-    "author": "madrays",
-    "level": 1,
-    "release": true,
-    "history": {
-      "v3.0.3": "跟进 MoviePilot 新版 durable 整理契约：插件接管前原子注销宿主准入责任，注销失败自动回退原生整理；修复订阅整理每15秒回放、缺少 execution checkpoint 和活动任务冲突。",
-      "v3.0.2": "适配 MoviePilot V3.1.2+ durable 整理重试接口，新宿主使用 _request_durable_transfer_retry，旧宿主保留 retry_scheduler 回退，避免失败任务每 15 秒重复报错。",
-      "v3.0.1": "改用 GitHub Release 整包安装，仅携带 Debian x86_64 / Python 3.14 的 Rust 加速轮子；完善 V3 durable 整理接管、原版配置迁移、短命令、图标与使用文档。",
-      "v3.0.0": "基于 DDSRem 与 zkmydgth 的现有实现做定点裁剪并合并 115Lite 存储；仅移除阿里云、签到、侧边栏、多端播放、频道搜索、捐赠、上传和 FUSE，其余原版功能保留；固定 p115client 与 concurrenttools 兼容依赖。"
-    },
-    "system_version": ">=3.0.0"
   }
 }

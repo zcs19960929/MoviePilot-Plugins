@@ -26,7 +26,7 @@ class FormTests(unittest.TestCase):
                 self.assertEqual(fields['scan_strategy']['items'], [
                     {'title':'全量模式', 'value':'full'}, {'title':'增量模式', 'value':'incremental'}])
                 self.assertEqual(fields['scan_mode']['label'], '扫描范围')
-            for storage in ('local', '115Lite', 'u115'):
+            for storage in ('local', 'u115'):
                 self.assertNotIn('scan_strategy', self.render(version, storage=storage)['snapshots'][0])
 
     def render(self, version='v3', **values):
@@ -59,7 +59,7 @@ class FormTests(unittest.TestCase):
     def test_old_id_lists_can_render_chinese_chips_and_legacy_paths_stay_editable(self):
         direct=self.render(scan_dirs=['id:7','/jav'],dir_labels={'id:7':'/电影'})['snapshots'][0]
         self.assertEqual(direct['scan_dirs']['modelValue'],[{'title':'/电影','value':'id:7'},{'title':'/jav','value':'/jav'}])
-        legacy=self.render(storage='115Lite',scan_dirs='/电影')['snapshots'][0]
+        legacy=self.render(storage='u115',scan_dirs='/电影')['snapshots'][0]
         self.assertNotIn('browse_path',legacy)
         self.assertNotIn('browse_display_path',legacy)
         self.assertNotIn('modelValue',legacy['scan_dirs'])
@@ -123,7 +123,7 @@ class FormTests(unittest.TestCase):
 
     def test_legacy_picker_adds_paths_and_keeps_the_browser_out_of_the_main_form(self):
         for version in ('v2','v3'):
-            for storage in ('local','115Lite','u115',{'value':'alist'}):
+            for storage in ('local','u115',{'value':'alist'}):
                 result=self.render(version,storage=storage,browse_path='/电影',
                                    scan_dirs='/已有目录',picker_flow={'confirm':True})
                 self.assertNotIn('browse_path',result['snapshots'][0])
@@ -201,9 +201,7 @@ class FormTests(unittest.TestCase):
                                   'archive_loose'} & local.keys())
                 self.assertNotIn('preview_limit', local)
                 self.assertIn('preview_limit', self.render(version, storage='local', download_previews=True)['snapshots'][0])
-                lite = self.render(version, storage='115Lite', organize=True, write_remote=True)['snapshots'][0]
-                self.assertFalse({'write_remote', 'organize', 'cookie115', 'archive_loose'} & lite.keys())
-                self.assertTrue({'write_local', 'trigger_strm', 'remote_lib_root', 'local_strm_root', 'rename_files'} <= lite.keys())
+                self.assertNotIn('trigger_strm', self.render(version, storage='u115')['snapshots'][0])
                 cloud = self.render(version, storage='u115', write_local=False, write_remote=True, organize=False)['snapshots'][0]
                 self.assertFalse({'remote_lib_root', 'local_strm_root', 'archive_loose'} & cloud.keys())
                 cloud = self.render(version, storage='alist', write_local=False, write_remote=True, organize=True)['snapshots'][0]
@@ -250,11 +248,11 @@ class FormTests(unittest.TestCase):
 class ConfigurationGuardTests(unittest.TestCase):
     def test_invalid_output_is_rejected_before_starting_a_task(self):
         for version in ('v2', 'v3'):
-            for storage in ('115Lite', 'u115', 'alist'):
+            for storage in ('u115', 'alist'):
                 plugin = load_plugin(version, Mock())
                 plugin.init_plugin(dict(enabled=True, storage=storage, metatube_url='http://backend',
-                                        scan_dirs='/source', write_local=False,
-                                        write_remote=storage == '115Lite', organize=True, remote_lib_root='/jav'))
+                                        scan_dirs='/source', write_local=False, write_remote=False,
+                                        organize=True, remote_lib_root='/jav'))
                 thread = Mock()
                 with patch.dict(plugin._MetaTubeScraper__api_run.__func__.__globals__,
                                 threading=types.SimpleNamespace(Thread=thread)):
@@ -280,29 +278,45 @@ class ConfigurationGuardTests(unittest.TestCase):
             self.assertEqual(result['code'], 400)
             self.assertIn(missing, result['msg'])
 
-    def test_115lite_ignores_hidden_upload_and_move_flags_without_erasing_saved_values(self):
+    def test_saved_115lite_config_is_rejected_with_an_actionable_message(self):
         for version in ('v2', 'v3'):
-            with tempfile.TemporaryDirectory() as directory:
-                def get(url, **kwargs):
-                    if '/images/' in url:
-                        return types.SimpleNamespace(status_code=200, headers={'content-type': 'image/jpeg'}, content=b'image', close=lambda: None)
-                    return response(200, {'data': [{'id': 'film'}]} if url.endswith('/search') else {'data': {'id': 'film', 'provider': 'JAV321', 'title': 'Fixture'}})
-                plugin = load_plugin(version, get)
-                config = dict(enabled=True, storage='115Lite', metatube_url='http://backend',
-                              scan_dirs='/jav', write_local=True, write_remote=True, organize=True,
-                              remote_lib_root='/jav', local_strm_root=directory, trigger_strm=False)
-                plugin.init_plugin(config)
-                plugin.list_children = lambda path: [{'name': 'DSOD-060.mp4', 'type': 'file'}]
-                plugin._MetaTubeScraper__throttle = lambda: None
-                plugin._MetaTubeScraper__upload_bytes = Mock(side_effect=AssertionError('upload forbidden'))
-                plugin._MetaTubeScraper__organize_move = Mock(side_effect=AssertionError('move forbidden'))
-                self.assertEqual(plugin._MetaTubeScraper__process_target('/jav/DSOD-060'), 'ok')
-                self.assertTrue((Path(directory) / 'DSOD-060/movie.nfo').is_file())
-                self.assertEqual(plugin._MetaTubeScraper__process_target('/source/DSOD-060'), 'skip')
-                plugin._MetaTubeScraper__upload_bytes.assert_not_called()
-                plugin._MetaTubeScraper__organize_move.assert_not_called()
-                self.assertTrue(config['write_remote'])
-                self.assertTrue(config['organize'])
+            plugin = load_plugin(version, Mock())
+            config = dict(enabled=True, storage='115Lite', metatube_url='http://backend',
+                          scan_dirs='/jav', write_local=True, remote_lib_root='/jav',
+                          local_strm_root='/tmp/local')
+            plugin.init_plugin(config)
+            thread = Mock()
+            with patch.dict(plugin._MetaTubeScraper__api_run.__func__.__globals__,
+                            threading=types.SimpleNamespace(Thread=thread)):
+                result = plugin._MetaTubeScraper__api_run()
+            self.assertEqual(result['code'], 400)
+            self.assertIn('115Lite', result['msg'])
+            self.assertIn('已移除', result['msg'])
+            thread.assert_not_called()
+            self.assertFalse(plugin.get_service())
+            # The saved value is preserved so the user can see what to change.
+            self.assertEqual(config['storage'], '115Lite')
+
+    def test_storage_list_no_longer_offers_the_removed_mode(self):
+        for version in ('v2', 'v3'):
+            form, _ = load_plugin(version, Mock()).get_form()
+            values = []
+
+            def walk(node):
+                if isinstance(node, dict):
+                    for item in (node.get('props', {}).get('items') or []):
+                        if isinstance(item, dict) and 'value' in item:
+                            values.append(item['value'])
+                    for child in node.get('content') or []:
+                        walk(child)
+                elif isinstance(node, list):
+                    for child in node:
+                        walk(child)
+
+            walk(form)
+            self.assertNotIn('115Lite', values)
+            self.assertIn('115_direct', values)
+            self.assertIn('u115', values)
 
 
 if __name__ == '__main__':

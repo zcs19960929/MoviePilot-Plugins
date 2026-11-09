@@ -2,7 +2,7 @@
 """
 MetaTube 番号刮削插件（MoviePilot V3）
 - 按番号调用自建 MetaTube 服务检索元数据，生成 movie.nfo / poster.jpg / fanart.jpg
-- 目录选择器：先选存储（本地 / 115Lite / u115 等），再逐级浏览选择，避免手输错误
+- 目录选择器：先选存储（本地 / u115 等），再逐级浏览选择，避免手输错误
 - 写入通道：本地存储走文件系统；网盘存储走 MoviePilot StorageChain 上传（受存储能力限制）
 - 内置读取/写入限速、单次上限、增量跳过，降低 115 风控风险
 """
@@ -50,23 +50,6 @@ except Exception:
         import logging
         _logger = logging.getLogger("metatubescraper")
 
-# 事件（用于通知 115Lite 生成 STRM）
-try:
-    from app.sdk.events import eventmanager
-except Exception:
-    try:
-        from app.core.event import eventmanager  # type: ignore
-    except Exception:
-        eventmanager = None  # type: ignore
-
-try:
-    from app.schemas.types import EventType
-except Exception:  # 不同版本路径兜底
-    try:
-        from app.schemas.event import EventType  # type: ignore
-    except Exception:
-        EventType = None  # type: ignore
-
 # MoviePilot V3 存储链（网盘目录浏览与上传）
 try:
     from app.chain.storage import StorageChain as _StorageChain
@@ -106,6 +89,10 @@ NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DV", "
     "AV1", "IMAX", "EXT", "FIN", "LEAK", "UNCUT", "CENSORED", "UNCENSORED",
     "NEW", "HQ", "GB", "MB", "TB", "ENG", "RAW", "CAM",
 }
+
+# Storage names this plugin used to accept but no longer implements. Saved
+# configs keep the value; validation rejects it instead of silently degrading.
+_REMOVED_STORAGE = {"115Lite"}
 
 _PRIVATE_LOG_FIELD = re.compile(r"authorization|cookie|token|apikey|password|secret|signature|pickcode|credential")
 _PRIVATE_LOG_TEXT = re.compile(
@@ -368,10 +355,10 @@ class MetaTubeScraper(_PluginBase):
     plugin_name = "MetaTube 番号刮削"
     plugin_desc = (
         "按番号调用自建 MetaTube 服务刮削元数据，生成 movie.nfo、poster.jpg、fanart.jpg 并写入所选存储目录。"
-        "支持本地与网盘存储（115Lite/u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
+        "支持本地与网盘存储（u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.2.2"
+    plugin_version = "1.3.0"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -421,7 +408,6 @@ class MetaTubeScraper(_PluginBase):
     _local_strm_root = ""
     _remote_lib_root = ""
     _organize = False
-    _trigger_strm = True
     _cloud115 = None
     _direct_service = None
     _direct_lock = threading.RLock()
@@ -520,17 +506,14 @@ class MetaTubeScraper(_PluginBase):
         self._local_strm_root = _pick_str(config.get("local_strm_root")).rstrip("/")
         self._remote_lib_root = _pick_str(config.get("remote_lib_root")).rstrip("/")
         self._organize = bool(config.get("organize"))
-        self._trigger_strm = bool(config.get("trigger_strm", True))
         # Compute effective options without modifying saved values: switching
         # back to a compatible mode restores the user's original selections.
         if self._storage == "115_direct":
             self._write_local = True
-            self._write_remote = self._organize = self._trigger_strm = False
+            self._write_remote = self._organize = False
             self._rename_files = self._download_previews = False
         elif self._is_local:
             self._write_local = True
-            self._write_remote = self._organize = self._trigger_strm = False
-        elif self._storage == "115Lite":
             self._write_remote = self._organize = False
 
     @property
@@ -543,6 +526,8 @@ class MetaTubeScraper(_PluginBase):
             errors.append("请填写 MetaTube 服务地址")
         if not self._scan_dirs:
             errors.append("请添加扫描目录")
+        if self._storage in _REMOVED_STORAGE:
+            errors.append("115Lite 兼容模式已移除，请重新选择存储类型（本地 / u115 / 其他存储）")
         if self._storage == "115_direct":
             if not self._cookie115:
                 errors.append("请填写 115 Cookie")
@@ -554,7 +539,7 @@ class MetaTubeScraper(_PluginBase):
                 errors.append("请填写 MoviePilot 播放入口地址")
         elif not self._is_local:
             if not (self._write_local or self._write_remote):
-                errors.append("请至少启用一种有效输出；115Lite 模式需要开启本地元数据输出")
+                errors.append("请至少启用一种有效输出")
             if self._write_local and not self._local_strm_root:
                 errors.append("本地元数据输出需要填写本地媒体库根目录")
             if self._write_local and self._local_strm_root and not Path(self._local_strm_root).is_absolute():
@@ -1032,7 +1017,7 @@ class MetaTubeScraper(_PluginBase):
                     moved += 1
                     self.info(f"[{number}] 已归位 {name} -> {target}")
                 else:
-                    self.warn(f"[{number}] 归位失败 {name}（该存储可能不支持 move；115Lite 需改用 u115 或手工归位）")
+                    self.warn(f"[{number}] 归位失败 {name}（该存储可能不支持 move，请改用 u115 或手工归位）")
             except Exception as e:
                 self.warn(f"[{number}] 归位异常 {name}: {e}")
         return target if moved else None
@@ -1102,21 +1087,6 @@ class MetaTubeScraper(_PluginBase):
         return results
 
     # ---------------- 单目录处理 ----------------
-
-    def __trigger_strm(self, remote_dir: str) -> None:
-        """通知 115Lite 为指定网盘目录生成 STRM（等价于消息命令 /115strm <目录>）"""
-        if not self._trigger_strm or not remote_dir:
-            return
-        if eventmanager is None or EventType is None:
-            return
-        try:
-            eventmanager.send_event(EventType.PluginAction, {
-                "action": "p115lite_strm",
-                "arg_str": remote_dir,
-            })
-            self.info(f"已通知 115Lite 为 {remote_dir} 生成 STRM")
-        except Exception as e:
-            self.debug(f"触发 115Lite STRM 生成失败: {e}")
 
     def __process_target(self, dir_path: str) -> str:
         try:
@@ -1239,9 +1209,6 @@ class MetaTubeScraper(_PluginBase):
                         continue
                     if self.__rename_video(dir_path, name, target_name):
                         self.info(f"[{number}] 已重命名 {name} -> {target_name}")
-
-            if wrote and not self._is_local:
-                self.__trigger_strm(final_remote)
 
             return "ok" if wrote else "fail"
         except Exception as e:
@@ -1520,9 +1487,8 @@ class MetaTubeScraper(_PluginBase):
         mode = "((storage && typeof storage === 'object') ? (storage.value || storage.title || 'local') : (storage || 'local'))"
         direct = f"({mode} === '115_direct')"
         local = f"({mode} === 'local')"
-        lite = f"({mode} === '115Lite')"
         remote = f"(!{direct} && !{local})"
-        writable = f"({remote} && !{lite})"
+        writable = remote
         mapped = f"({remote} && write_local)"
         moving = f"({writable} && organize)"
         legacy = f"(!{direct})"
@@ -1585,16 +1551,14 @@ class MetaTubeScraper(_PluginBase):
                 "items": [
                     {"title": "115 Cookie 直连（独立生成 STRM）", "value": "115_direct"},
                     {"title": "本地存储（local）", "value": "local"},
-                    {"title": "115Lite 兼容模式（本地元数据）", "value": "115Lite"},
                     {"title": "MP 原生 115（u115，可上传）", "value": "u115"},
                     {"title": "其他存储（可手填存储名）", "value": "alist"},
                 ],
             }}, md=12)),
             alert("直连模式会规范视频和关联字幕名称，并生成本地 STRM、字幕、NFO 和图片。可按番号整理网盘目录。", direct),
             alert("本地模式在影片原目录生成 NFO 和图片，不生成 STRM。", local),
-            alert("115Lite 兼容模式不支持元数据上传和本插件的自动归位；可写本地 NFO/图片，并通知 115Lite 生成 STRM。", lite),
             alert("通过 MoviePilot 存储接口读写；上传、移动是否可用取决于所选存储。", writable),
-            row(text("cookie115", "115 Cookie", tip="可复用 115Lite Cookie；与 MetaTube Token 不同。修改后先保存再检查。",
+            row(text("cookie115", "115 Cookie", tip="与 MetaTube Token 不同；修改后先保存再检查。",
                      md=12, show=direct, type="password", **{"onUpdate:modelValue": JS_COOKIE_CHANGE})),
             row(button("检查已保存的 115 Cookie", JS_CHECK115, show=direct,
                        loading=expr("cookie115_checking"), disabled=expr("cookie115_checking")),
@@ -1673,16 +1637,13 @@ class MetaTubeScraper(_PluginBase):
                     alert("固定按番号前缀／番号生成本地媒体库；同一目录只交给一个插件整理。媒体服务器请读取本地 NFO，避免回写覆盖。", direct),
                     row(switch("write_local", "在本地生成 NFO 和图片", "这里只写元数据，不生成 STRM", show=remote),
                         switch("write_remote", "向网盘写入 NFO 和图片", "需要所选存储支持上传", show=writable)),
-                    alert("尚未选择有效输出；115Lite 模式需要启用本地元数据输出。",
-                          f"{remote} && !write_local && (!{writable} || !write_remote)", kind="warning"),
+                    alert("尚未选择有效输出，请至少启用本地或网盘其中一项。",
+                          f"{remote} && !write_local && !write_remote", kind="warning"),
                     row(text("remote_lib_root", "网盘媒体库根目录", "/jav",
                              "用于本地路径映射或自动归位；未开启归位时，影片须已位于此目录内", show=f"{mapped} || {moving}"),
                         text("local_strm_root", "本地媒体库根目录", "/media/strm/jav",
                              expr(f"{direct} ? '容器内可写的绝对路径，按番号前缀／番号生成 STRM、字幕和元数据；首次建议使用独立目录' : '与网盘媒体库根目录对应的本地 STRM 根目录，用于补充 NFO 和图片'"), show=f"{direct} || {mapped}")),
-                    row(switch("organize", "自动归位到网盘媒体库", "需要存储支持移动；仅移动视频，外挂字幕不会跟随", show=writable),
-                        switch("trigger_strm", "刮完通知 115Lite 生成 STRM",
-                               "仅适用于同一 115 网盘目录；需启用 115Lite 并配置本地目录与网盘目录映射",
-                               show=f"{remote} && (write_local || ({writable} && write_remote))")),
+                    row(switch("organize", "自动归位到网盘媒体库", "需要存储支持移动；仅移动视频，外挂字幕不会跟随", show=writable)),
                 ]},
             ]},
             row(col({"component": "VSelect", "props": {
@@ -1743,7 +1704,7 @@ class MetaTubeScraper(_PluginBase):
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
-            "organize": False, "trigger_strm": True, "scan_mode": "subdir", "scan_strategy": "full", "file_interval": 3,
+            "organize": False, "scan_mode": "subdir", "scan_strategy": "full", "file_interval": 3,
             "movie_limit": 30, "cron_hour": 4, "cron_minute": 30, "force_overwrite": False,
             "schedule_mode": "daily", "schedule_weekday": "mon", "schedule_interval": 60, "cron_expression": "30 4 * * *",
             "download_previews": False, "preview_limit": 10, "rename_files": False, "numeric_ids": False,
