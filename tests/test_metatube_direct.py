@@ -158,10 +158,10 @@ class DirectAcceptanceTests(unittest.TestCase):
                 stats = service.run(["0"])
                 self.assertEqual(stats["ok"], 1)
                 output = Path(directory) / "library" / "DSOD" / "DSOD-060"
-                self.assertEqual(cloud.entries["1"].name, "DSOD-060 - V0001.mp4")
-                self.assertEqual(cloud.entries["2"].name, "DSOD-060 - V0001.zh.ass")
-                self.assertEqual((output / "DSOD-060 - V0001.zh.ass").read_bytes(), b"subtitle:2")
-                strm = (output / "DSOD-060 - V0001.strm").read_text()
+                self.assertEqual(cloud.entries["1"].name, "DSOD-060.mp4")
+                self.assertEqual(cloud.entries["2"].name, "DSOD-060.zh.ass")
+                self.assertEqual((output / "DSOD-060.zh.ass").read_bytes(), b"subtitle:2")
+                strm = (output / "DSOD-060.strm").read_text()
                 self.assertTrue(strm.startswith("https://mp.example/api/v1/plugin/MetaTubeScraper/redirect_url?media_id="))
                 self.assertNotIn("P115Lite", strm)
                 self.assertNotIn("pickcode", strm)
@@ -171,11 +171,11 @@ class DirectAcceptanceTests(unittest.TestCase):
                 calls = list(cloud.renames)
                 self.assertEqual(service.run(["0"])["skip"], 1)
                 self.assertEqual(cloud.renames, calls)
-                (output / "DSOD-060 - V0001.strm").unlink()
-                (output / "DSOD-060 - V0001.zh.ass").unlink()
+                (output / "DSOD-060.strm").unlink()
+                (output / "DSOD-060.zh.ass").unlink()
                 self.assertEqual(service.run(["0"])["ok"], 1)
                 self.assertEqual(cloud.renames, calls)
-                self.assertEqual((output / "DSOD-060 - V0001.strm").read_text(), strm)
+                self.assertEqual((output / "DSOD-060.strm").read_text(), strm)
 
     def test_metadata_failure_never_renames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -288,9 +288,9 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060 - V0001.en.srt", pickcode="c" * 17)
+            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060.en.srt", pickcode="c" * 17)
             self.assertEqual(service.run(["0"])["ok"], 1)
-            self.assertEqual((Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.en.srt").read_bytes(), b"subtitle:3")
+            self.assertEqual((Path(directory) / "library/DSOD/DSOD-060/DSOD-060.en.srt").read_bytes(), b"subtitle:3")
 
     def test_force_refreshes_metadata_but_does_not_repeat_cloud_renames(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -298,7 +298,7 @@ class DirectAcceptanceTests(unittest.TestCase):
             service.run(["0"])
             rename_calls = list(cloud.renames)
             metadata.return_value = {"provider": "FANZA", "id": "film", "title": "Corrected title"}
-            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060 - V0001.en.srt", pickcode="c" * 17)
+            cloud.entries["3"] = m.Entry("3", "0", "DSOD-060.en.srt", pickcode="c" * 17)
             service.force = True
             self.assertEqual(service.run(["0"])["ok"], 1)
             nfo = Path(directory) / "library/DSOD/DSOD-060/movie.nfo"
@@ -337,7 +337,7 @@ class DirectAcceptanceTests(unittest.TestCase):
             service.registry.reopen()
             self.assertEqual(service.run(["0"])["ok"], 1)
             self.assertEqual([fid for fid, name in cloud.renames].count("1"), 1)
-            self.assertEqual(cloud.entries["2"].name, "DSOD-060 - V0001.zh.ass")
+            self.assertEqual(cloud.entries["2"].name, "DSOD-060.zh.ass")
 
     def test_multipart_and_language_and_vobsub_pairs(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -351,7 +351,7 @@ class DirectAcceptanceTests(unittest.TestCase):
             ]}
             self.assertEqual(service.run(["0"])["ok"], 1)
             output = Path(directory) / "library" / "DSOD" / "DSOD-060"
-            for name in ("DSOD-060 - V0001-CD1.strm", "DSOD-060 - V0001-CD2.strm", "DSOD-060 - V0001-CD1.zh-Hans.forced.ass", "DSOD-060 - V0001-CD2.zh.idx", "DSOD-060 - V0001-CD2.zh.sub"):
+            for name in ("DSOD-060-CD1.strm", "DSOD-060-CD2.strm", "DSOD-060-CD1.zh-Hans.forced.ass", "DSOD-060-CD2.zh.idx", "DSOD-060-CD2.zh.sub"):
                 self.assertTrue((output / name).is_file(), name)
 
 
@@ -391,7 +391,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
             with concurrent.futures.ThreadPoolExecutor(max_workers=6) as pool:
                 urls = list(pool.map(lambda _: service.playback_url(media_id, "Emby"), range(6)))
             self.assertEqual(len(set(urls)), 1)
@@ -413,7 +413,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            strm = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text()
+            strm = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").read_text()
             media_id = strm.strip().split("media_id=")[1]
             self.assertEqual(len(media_id), 64)
             self.assertTrue(service.playback_url(media_id, "Emby").startswith("https://cdn.115.com/"))
@@ -431,7 +431,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
             cloud.download_link = lambda *a, **k: m.DirectLink("https://cdn.115.com/v?f=3", {"Cookie": "secret"}, 4102444800)
             with self.assertRaises(m.CloudError):
                 service.playback_url(media_id, "Emby")
@@ -440,7 +440,7 @@ class DirectAcceptanceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             m, cloud, metadata, service = self.make(directory)
             service.run(["0"])
-            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").read_text().strip().split("media_id=")[1]
+            media_id = (Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").read_text().strip().split("media_id=")[1]
             cloud.download_link = lambda *a, **k: m.DirectLink("http://cdn.115.com/video?t=4102444800", {}, 4102444800)
             self.assertTrue(service.playback_url(media_id, "Emby").startswith("http://cdn.115.com/"))
 

@@ -58,7 +58,7 @@ class ScanProgressTests(unittest.TestCase):
         third = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertFalse(third['scan_resumed'])
         self.assertEqual((third['ok'], third['skip']), (1, 2))
-        self.assertTrue((service.root/'IPX/IPX-203/IPX-203 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-203/IPX-203.strm').is_file())
 
     def test_resuming_does_not_revisit_finished_directories(self):
         _, cloud, _, service = self.library(entries=[
@@ -86,7 +86,11 @@ class ScanProgressTests(unittest.TestCase):
         metadata.side_effect = lookup
         first = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual(first['notfound'], 1)
-        cloud.fail_rename = '2'
+        # A genuine single-movie ownership conflict advances; uncertain network
+        # mutation results instead pause and preserve their rename journal.
+        conflict = service.root/'IPX/IPX-202/movie.nfo'
+        conflict.parent.mkdir(parents=True)
+        conflict.write_bytes(b'unowned file')
         second = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual(second['fail'], 1)
         third = service.run(['0'], limit=1, scan_strategy='incremental')
@@ -104,7 +108,7 @@ class ScanProgressTests(unittest.TestCase):
         service = self.restart(service)
         result = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual(result['ok'], 1)
-        self.assertTrue((service.root/'IPX/IPX-201/IPX-201 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-201/IPX-201.strm').is_file())
         self.assertEqual(cloud.entries['2'].name, 'IPX-202.mp4')
 
     def test_stop_after_publication_replays_without_renaming_or_changing_link(self):
@@ -116,7 +120,7 @@ class ScanProgressTests(unittest.TestCase):
         service._process_movie = interrupted
         first = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertTrue(first['stopped'])
-        path = service.root/'IPX/IPX-201/IPX-201 - V0001.strm'
+        path = service.root/'IPX/IPX-201/IPX-201.strm'
         link, renames = path.read_bytes(), list(cloud.renames)
         service = self.restart(service)
         service.run(['0'], limit=1, scan_strategy='incremental')
@@ -140,7 +144,7 @@ class ScanProgressTests(unittest.TestCase):
         cloud.listdir = original
         result = self.restart(service).run(['7'], limit=1, scan_strategy='incremental')
         self.assertEqual(result['ok'], 1)
-        self.assertTrue((service.root/'IPX/IPX-202/IPX-202 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-202/IPX-202.strm').is_file())
 
     def test_pending_directory_moved_outside_scope_is_not_read_or_modified(self):
         _, cloud, _, service = self.library(entries=[
@@ -193,13 +197,13 @@ class ScanProgressTests(unittest.TestCase):
         result = self.restart(service).run(['7', '8'], limit=1, scan_strategy='incremental')
         self.assertEqual(result['ok'], 1)
         self.assertEqual([call.args[0] for call in metadata.call_args_list], ['IPX-203'])
-        self.assertEqual(cloud.entries['2'].name, 'IPX-203 - V0001.mp4')
+        self.assertEqual(cloud.entries['2'].name, 'IPX-203.mp4')
         self.assertFalse((service.root/'IPX/IPX-202').exists())
 
     def test_full_mode_discards_old_cursor_and_keeps_media_registry(self):
         _, cloud, _, service = self.library(3)
         service.run(['0'], limit=1, scan_strategy='incremental')
-        path = service.root/'IPX/IPX-201/IPX-201 - V0001.strm'
+        path = service.root/'IPX/IPX-201/IPX-201.strm'
         link = path.read_bytes()
         full = service.run(['0'], limit=1)
         self.assertEqual((full['ok'], full['skip']), (1, 1))
@@ -263,7 +267,7 @@ class ScanProgressTests(unittest.TestCase):
         self.assertEqual(list(service.root.rglob('*.strm')), [])
         again = self.restart(service).run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual(again['ok'], 1)
-        self.assertTrue((service.root/'IPX/IPX-201/IPX-201 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-201/IPX-201.strm').is_file())
 
     def test_post_publication_commit_failure_preserves_uncommitted_batch(self):
         _, cloud, _, service = self.library(2)
@@ -276,20 +280,20 @@ class ScanProgressTests(unittest.TestCase):
         with patch.object(progress.ScanProgress, 'save', saving):
             result = service.run(['0'], limit=1, scan_strategy='incremental')
         self.assertTrue(result['stopped'])
-        first = service.root/'IPX/IPX-201/IPX-201 - V0001.strm'
+        first = service.root/'IPX/IPX-201/IPX-201.strm'
         link = first.read_bytes()
         self.assertEqual(cloud.entries['2'].name, 'IPX-202.mp4')
         again = self.restart(service).run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual((again['ok'], again['skip']), (1, 1))
         self.assertEqual(first.read_bytes(), link)
-        self.assertEqual([item for item in cloud.renames if item[0] == '1'], [('1', 'IPX-201 - V0001.mp4')])
+        self.assertEqual([item for item in cloud.renames if item[0] == '1'], [])
 
     def test_corrupt_checkpoint_restarts_and_does_not_remove_media(self):
         _, cloud, _, service = self.library()
         service.run(['0'], limit=1, scan_strategy='incremental')
         with service.registry.db:
             service.registry.db.execute("UPDATE scan_checkpoint SET payload='invalid json' WHERE key='meta'")
-        first = service.root/'IPX/IPX-201/IPX-201 - V0001.strm'
+        first = service.root/'IPX/IPX-201/IPX-201.strm'
         link = first.read_bytes()
         result = self.restart(service).run(['0'], limit=1, scan_strategy='incremental')
         self.assertFalse(result['scan_resumed'])
@@ -317,7 +321,7 @@ class ScanProgressTests(unittest.TestCase):
             stale.save(previous)
         result = self.restart(service).run(['0'], limit=1, scan_strategy='incremental')
         self.assertEqual((result['ok'], result['skip']), (1, 0))
-        self.assertTrue((service.root/'IPX/IPX-203/IPX-203 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-203/IPX-203.strm').is_file())
 
     def test_concurrent_checkpoint_compare_and_write_are_one_transaction(self):
         _, _, _, service = self.library()
@@ -400,7 +404,7 @@ class ScanProgressTests(unittest.TestCase):
                 again = service.run(roots, limit=1, scan_strategy='incremental')
                 self.assertTrue(again['scan_resumed'])
                 self.assertEqual(again['ok'], 1)
-                self.assertTrue((service.root/'IPX/IPX-201/IPX-201 - V0001.strm').is_file())
+                self.assertTrue((service.root/'IPX/IPX-201/IPX-201.strm').is_file())
 
     def test_scope_settings_invalidate_checkpoint_but_limit_does_not(self):
         for setting in ('archive', 'numeric', 'recursive', 'roots', 'output', 'account', 'limit'):
@@ -442,7 +446,7 @@ class ScanProgressTests(unittest.TestCase):
         self.assertEqual(result['fail'], 0)
         self.assertTrue(result['scan_cycle_complete'])
         self.assertEqual(result['ok'], 1)
-        self.assertTrue((service.root/'IPX/IPX-203/IPX-203 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-203/IPX-203.strm').is_file())
         self.assertFalse((service.root/'IPX/IPX-778').exists())
         # A later run must not stall on the same vanished ID again.
         again = self.restart(service).run(['7'], limit=5, scan_strategy='incremental')
@@ -464,7 +468,7 @@ class ScanProgressTests(unittest.TestCase):
         self.assertFalse(result.get('stopped', False))
         self.assertEqual(result['fail'], 0)
         self.assertEqual(result['ok'], 1)
-        self.assertTrue((service.root/'IPX/IPX-202/IPX-202 - V0001.strm').is_file())
+        self.assertTrue((service.root/'IPX/IPX-202/IPX-202.strm').is_file())
 
     def test_unreadable_directory_still_pauses_and_keeps_position(self):
         m, cloud, _, service = self.library(entries=[

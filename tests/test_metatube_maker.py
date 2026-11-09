@@ -88,8 +88,8 @@ class MakerLibraryTests(unittest.TestCase):
         result = service.run(['7'])
         self.assertEqual(result['fail'], 0, result)
         movie = service.root/'IDEA POCKET/IPX-201'
-        self.assertTrue((movie/'IPX-201 - V0001.strm').is_file())
-        self.assertEqual((movie/'IPX-201 - V0001.zh.ass').read_bytes(), b'subtitle:2')
+        self.assertTrue((movie/'IPX-201.strm').is_file())
+        self.assertEqual((movie/'IPX-201.zh.ass').read_bytes(), b'subtitle:2')
         folder = self.cloud.info(self.cloud.info('1').parent_id)
         category = self.cloud.info(folder.parent_id)
         self.assertEqual((category.parent_id, category.name, folder.name), ('77','IDEA POCKET','IPX-201'))
@@ -99,13 +99,13 @@ class MakerLibraryTests(unittest.TestCase):
         old = self.service(layout='prefix', cleanup=False)
         self.assertEqual(old.run(['7'])['ok'], 1)
         old_folder = old.root/'IPX/IPX-201'
-        url = (old_folder/'IPX-201 - V0001.strm').read_bytes()
+        url = (old_folder/'IPX-201.strm').read_bytes()
         old.close()
         new = self.service()
         result = new.run(['7'])
         self.assertEqual(result['fail'], 0, result)
         new_folder = new.root/'IDEA POCKET/IPX-201'
-        self.assertEqual((new_folder/'IPX-201 - V0001.strm').read_bytes(), url)
+        self.assertEqual((new_folder/'IPX-201.strm').read_bytes(), url)
         self.assertFalse(old_folder.exists())
         self.assertFalse((new.root/'IPX').exists())
         self.assertTrue(self.cloud.recycled)
@@ -126,12 +126,12 @@ class MakerLibraryTests(unittest.TestCase):
     def test_rules_and_target_changes_revisit_registered_movies_outside_sources(self):
         first = self.service(target='id:77')
         self.assertEqual(first.run(['7'])['ok'], 1)
-        url = (first.root/'IDEA POCKET/IPX-201/IPX-201 - V0001.strm').read_bytes()
+        url = (first.root/'IDEA POCKET/IPX-201/IPX-201.strm').read_bytes()
         first.close()
         second = self.service(target='id:88', rules='主力=アイデアポケット')
         result = second.run(['7'])
         self.assertEqual(result['fail'], 0, result)
-        self.assertEqual((second.root/'主力/IPX-201/IPX-201 - V0001.strm').read_bytes(), url)
+        self.assertEqual((second.root/'主力/IPX-201/IPX-201.strm').read_bytes(), url)
         folder = self.cloud.info(self.cloud.info('1').parent_id)
         self.assertEqual(self.cloud.info(folder.parent_id).parent_id, '88')
         self.assertEqual(self.cloud.info(folder.parent_id).name, '主力')
@@ -254,7 +254,7 @@ class MakerLibraryTests(unittest.TestCase):
     def test_local_move_replays_after_link_but_before_registry_commit(self):
         old = self.service(layout='prefix', cleanup=False)
         old.run(['7'])
-        url = (old.root/'IPX/IPX-201/IPX-201 - V0001.strm').read_bytes()
+        url = (old.root/'IPX/IPX-201/IPX-201.strm').read_bytes()
         old.close()
         new = self.service()
         with patch.object(new.migrations, '_acknowledge', side_effect=OSError('power loss')):
@@ -265,7 +265,7 @@ class MakerLibraryTests(unittest.TestCase):
         restarted = self.service(rules='最新分类=アイデアポケット')
         result = restarted.run(['7'], scan_strategy='incremental')
         self.assertEqual(result['fail'], 0, result)
-        self.assertEqual((restarted.root/'最新分类/IPX-201/IPX-201 - V0001.strm').read_bytes(), url)
+        self.assertEqual((restarted.root/'最新分类/IPX-201/IPX-201.strm').read_bytes(), url)
         self.assertFalse((restarted.root/'IPX').exists())
         self.assertFalse((restarted.root/'IDEA POCKET').exists())
 
@@ -322,6 +322,7 @@ class MakerLibraryTests(unittest.TestCase):
         self.assertTrue((third.root/'主力/IPX-201/movie.nfo').exists())
 
     def test_archive_off_does_not_replay_pending_rename(self):
+        self.cloud.entries['1'] = dataclasses.replace(self.cloud.info('1'),name='IPX-201 incoming.mp4')
         first = self.service(layout='prefix')
         self.cloud.fail_rename = '1'
         self.assertEqual(first.run(['7'])['fail'], 1)
@@ -332,12 +333,12 @@ class MakerLibraryTests(unittest.TestCase):
         result = again.run(['7'])
         self.assertEqual(result['fail'], 0, result)
         self.assertEqual(self.cloud.renames, before)
-        self.assertTrue((again.root/'IDEA POCKET/IPX-201/IPX-201 - V0001.strm').exists())
+        self.assertTrue((again.root/'IDEA POCKET/IPX-201/IPX-201.strm').exists())
 
     def test_cloud_move_before_database_commit_replays_using_actual_file_id(self):
         first = self.service(target='id:77')
         first.run(['7'])
-        token = (first.root/'IDEA POCKET/IPX-201/IPX-201 - V0001.strm').read_bytes()
+        token = (first.root/'IDEA POCKET/IPX-201/IPX-201.strm').read_bytes()
         first.close()
         second = self.service(target='id:88')
         save = second.registry.save_version
@@ -355,7 +356,7 @@ class MakerLibraryTests(unittest.TestCase):
         result = third.run(['7'], scan_strategy='incremental')
         self.assertEqual(result['fail'], 0, result)
         self.assertEqual(third.migrations.plan('IPX-201')['stage'], 'done')
-        self.assertEqual((third.root/'IDEA POCKET/IPX-201/IPX-201 - V0001.strm').read_bytes(), token)
+        self.assertEqual((third.root/'IDEA POCKET/IPX-201/IPX-201.strm').read_bytes(), token)
         self.assertEqual(self.cloud.info('1').parent_id, self.cloud.info('2').parent_id)
 
 

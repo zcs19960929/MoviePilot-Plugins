@@ -276,7 +276,7 @@ class HostTests(unittest.TestCase):
             plugin.save_data = Mock()
             plugin._MetaTubeScraper__scrape_all()
             self.assertEqual(plugin.save_data.call_args.args[1]["ok"], 1)
-            self.assertTrue((Path(directory) / "library/DSOD/DSOD-060/DSOD-060 - V0001.strm").is_file())
+            self.assertTrue((Path(directory) / "library/DSOD/DSOD-060/DSOD-060.strm").is_file())
 
     def test_host_factory_uses_real_backend_callbacks_and_independent_auth(self):
         fixture = fixtures.DirectAcceptanceTests()
