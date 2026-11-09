@@ -24,6 +24,10 @@ class Stopped(CloudError):
     pass
 
 
+class NotFoundError(CloudError):
+    """The object is gone (deleted, recycled or never existed), not unreadable."""
+
+
 @dataclass(frozen=True)
 class Entry:
     id: str
@@ -76,15 +80,26 @@ class Cloud115:
             raise Stopped("任务已停止")
         self._last_request = time.monotonic()
 
+    # 115 answers a deleted or recycled object with one of these codes. During a
+    # long scan that is an ordinary state, not an interface failure.
+    MISSING_CODES = frozenset({"800001", "20009", "20013", "20018"})
+
     @staticmethod
     def _check(response):
         if isinstance(response, dict) and response.get("state") in (False, 0):
             code = str(response.get("errno") or response.get("errNo") or response.get("errcode")
                        or response.get("code") or response.get("error_code") or "unknown")
+            if code in Cloud115.MISSING_CODES:
+                raise NotFoundError("115 目录或文件不存在（错误代码 " + code + "）")
             if code in {"911", "590075", "40101004", "429", "405"}:
                 raise RiskError("115 要求验证或限制请求，请停止任务后检查账户")
             if code in {"99", "401", "40101032", "40101017"}:
                 raise AuthenticationError("115 Cookie 已失效，请更新后重试")
+            detail = str(response.get("error") or response.get("message") or "").strip()
+            # Only echo localized messages: 115 error text must never carry
+            # request URLs, pickcodes or Cookie values into logs.
+            if detail and re.search("[\u4e00-\u9fff]", detail):
+                raise CloudError("115 接口返回错误代码 " + code + "：" + detail[:60])
             raise CloudError("115 接口返回错误代码 " + code)
         return response
 
@@ -107,6 +122,8 @@ class Cloud115:
                 if self._debug:
                     code = status if isinstance(status, int) else "未知"
                     self._debug(f"115 {method} 请求异常={type(exc).__name__} HTTP={code}")
+                if isinstance(exc, FileNotFoundError):
+                    raise NotFoundError("115 目录或文件不存在") from None
                 if status in (405, 429) or "Risk" in type(exc).__name__:
                     raise RiskError("115 请求受到限制，请检查账户状态") from None
                 if status in (401, 403) or any(name in type(exc).__name__ for name in ("Login", "Authentication")):
@@ -179,6 +196,10 @@ class Cloud115:
                                             "limit": 500, "offset": offset})
             breadcrumbs = result.get("path") or []
             if breadcrumbs and str(breadcrumbs[-1].get("cid", breadcrumbs[-1].get("id"))) != cid:
+                # 115 falls back to the root path when the requested directory is
+                # gone; a real mismatch elsewhere still stops the scan.
+                if cid != "0" and str(breadcrumbs[-1].get("cid", breadcrumbs[-1].get("id"))) == "0":
+                    raise NotFoundError("115 目录不存在（错误代码 800001）")
                 raise CloudError("115 返回了不同目录，已停止扫描")
             total = int(result.get("count", 0))
             if count is not None and total != count:
@@ -228,7 +249,12 @@ class Cloud115:
     def info(self, fid):
         # Unlike fs_file_skim, get_info includes the parent ID required to
         # verify directory identity and resumable rename operations.
-        response = self._call("fs_file", {"file_id": str(fid)})
+        try:
+            response = self._call("fs_file", {"file_id": str(fid)})
+        except NotFoundError:
+            # 115 also answers 800001 transiently right after a move or rename;
+            # one retry separates that from a directory that is really gone.
+            response = self._call("fs_file", {"file_id": str(fid)})
         data = response.get("data") or []
         if not data:
             raise CloudError("115 文件不存在或不可访问")

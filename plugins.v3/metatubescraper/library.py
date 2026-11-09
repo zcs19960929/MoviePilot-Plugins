@@ -12,13 +12,21 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .cloud115 import AuthenticationError, CloudError, Entry, RiskError, Stopped
+from .cloud115 import AuthenticationError, CloudError, Entry, NotFoundError, RiskError, Stopped
 from .direct import PlaybackService, Registry, SUBTITLE_EXTS, VIDEO_EXTS, _part, checked_path, digest
 from .scan_progress import CheckpointError, ScanProgress
 
 
 class ScanReadError(CloudError):
     """Directory failures must retain the current checkpoint, not skip a movie."""
+
+
+class DirectoryGone(CloudError):
+    """A queued directory no longer exists; it can be dropped, not paused on."""
+
+    def __init__(self, message, cid=None):
+        super().__init__(message)
+        self.cid = cid
 
 
 def category(number):
@@ -203,6 +211,8 @@ class LibraryService(PlaybackService):
             return self.client.listdir(cid)
         except (AuthenticationError, RiskError, Stopped):
             raise
+        except NotFoundError as exc:
+            raise DirectoryGone('目录已不存在：' + str(exc), cid) from None
         except Exception as exc:
             reason = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
             raise ScanReadError('目录读取失败，已保留扫描位置：'+reason) from None
@@ -215,6 +225,8 @@ class LibraryService(PlaybackService):
             return entry
         except (AuthenticationError, RiskError, Stopped, ScanReadError):
             raise
+        except NotFoundError as exc:
+            raise DirectoryGone('目录已不存在：' + str(exc), cid) from None
         except Exception as exc:
             reason = str(exc) if isinstance(exc, CloudError) else type(exc).__name__
             raise ScanReadError('目录核验失败，已保留扫描位置：'+reason) from None
@@ -629,6 +641,26 @@ class LibraryService(PlaybackService):
         state['done'] = not state['queue'] and state['current'] is None
         self._commit_scan(state)
 
+    def _drop_directory(self, key, cid, name, exc):
+        """Skip a queued directory that no longer exists, keeping the rest of the queue."""
+        state = deepcopy(self._scan_state)
+        state['queue'].pop(key, None)
+        if cid not in state['seen']:
+            state['seen'].append(cid)
+        self._commit_scan(state)
+        self._error(f'待扫描目录已不存在，已跳过：{name or cid}（{exc}）')
+
+    def _drop_current_directory(self, cid, display, exc):
+        """Abandon the directory being processed when it disappears mid-batch."""
+        state = deepcopy(self._scan_state)
+        state['current'] = None
+        if cid not in state['seen']:
+            state['seen'].append(cid)
+        state['done'] = not state['queue']
+        self._current_entries = None
+        self._commit_scan(state)
+        self._error(f'当前扫描目录已不存在，已跳过：{display or cid}（{exc}）')
+
     def _check_directory_binding(self, cid):
         """A queued ID can survive a move; its authorization must also survive."""
         visited, chain = set(), []
@@ -674,9 +706,14 @@ class LibraryService(PlaybackService):
                     continue
                 if self._current_entries is None or self._current_entries[0] != current['directory']:
                     cid = current['directory']
-                    folder = self._check_directory_binding(cid)
+                    try:
+                        folder = self._check_directory_binding(cid)
+                        entries = self._listdir(cid)
+                    except DirectoryGone as exc:
+                        self._drop_current_directory(cid, current['display'], exc)
+                        continue
                     self._current_folder_name = folder.name if folder else ''
-                    self._current_entries = (cid, {entry.id: entry for entry in self._listdir(cid)}, False)
+                    self._current_entries = (cid, {entry.id: entry for entry in entries}, False)
                     self._directory_scope_checks = set()
                 yield number, dict(videos=[], entries=[], root=group['root'], directory=current['directory'],
                                    paths={current['display']}, video_ids=group['videos'])
@@ -695,13 +732,20 @@ class LibraryService(PlaybackService):
                 continue
             # Do not pop the directory until all pagination and its snapshot
             # commit succeed. A read/commit error leaves it at the queue head.
-            if self._resuming_scan:
-                folder = self._check_directory_binding(cid)
-                folder_name = folder.name if folder else ''
-            elif cid in self._scan_folders:
-                folder = self._scan_folders[cid]
-                folder_name = folder.name if folder else ''
-            entries = self._listdir(cid)
+            try:
+                if self._resuming_scan:
+                    folder = self._check_directory_binding(cid)
+                    folder_name = folder.name if folder else ''
+                elif cid in self._scan_folders:
+                    folder = self._scan_folders[cid]
+                    folder_name = folder.name if folder else ''
+                entries = self._listdir(cid)
+            except DirectoryGone as exc:
+                # The directory was deleted or recycled after the checkpoint was
+                # written. Skipping it is the only way forward: keeping the head
+                # would repeat the same 800001 on every later run.
+                self._drop_directory(key, cid, folder_name, exc)
+                continue
             state = deepcopy(state)
             del state['queue'][key]
             if candidate_category:
@@ -904,6 +948,9 @@ class LibraryService(PlaybackService):
                 status = self._process_movie(number, context['videos'], list(unique.values()), context['root']) if context['videos'] else 'skip'
             except (AuthenticationError, RiskError, Stopped, ScanReadError, CheckpointError):
                 raise
+            except DirectoryGone as exc:
+                self._drop_current_directory(context['directory'], sorted(context['paths']), exc)
+                continue
             except Exception as exc:
                 status = 'fail'
                 message = str(exc) if isinstance(exc, CloudError) else type(exc).__name__

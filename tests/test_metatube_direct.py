@@ -51,6 +51,8 @@ class FakeCloud:
         return [e for e in self.entries.values() if e.parent_id == str(cid)]
 
     def info(self, fid):
+        if str(fid) not in self.entries:
+            raise self.module.NotFoundError("115 目录或文件不存在（错误代码 800001）")
         return self.entries[str(fid)]
 
     def rename(self, fid, name):

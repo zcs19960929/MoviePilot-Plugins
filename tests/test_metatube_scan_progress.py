@@ -3,6 +3,7 @@ import dataclasses
 import importlib
 import tempfile
 import threading
+import types
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -420,6 +421,64 @@ class ScanProgressTests(unittest.TestCase):
                 if setting == 'limit':
                     self.assertEqual((result['ok'], result['skip']), (2, 0))
 
+    def test_vanished_queue_directory_is_skipped_instead_of_pausing_forever(self):
+        m, cloud, _, service = self.library(entries=[
+            dict(id='7', parent_id='0', name='jav', is_dir=True),
+            dict(id='8', parent_id='7', name='IPX-201', is_dir=True),
+            dict(id='1', parent_id='8', name='IPX-201.mp4', pickcode='a'*17),
+            dict(id='9', parent_id='7', name='IPX-778', is_dir=True),
+            dict(id='2', parent_id='9', name='IPX-778.mp4', pickcode='b'*17),
+            dict(id='11', parent_id='7', name='IPX-203', is_dir=True),
+            dict(id='3', parent_id='11', name='IPX-203.mp4', pickcode='c'*17),
+        ])
+        service.run(['7'], limit=1, scan_strategy='incremental')
+        # The queued directory disappears (deleted or recycled) before resume.
+        del cloud.entries['9']
+        service = self.restart(service)
+        result = service.run(['7'], limit=5, scan_strategy='incremental')
+        self.assertFalse(result.get('stopped', False))
+        self.assertEqual(result['fail'], 0)
+        self.assertTrue(result['scan_cycle_complete'])
+        self.assertEqual(result['ok'], 1)
+        self.assertTrue((service.root/'IPX/IPX-203/IPX-203 - V0001.strm').is_file())
+        self.assertFalse((service.root/'IPX/IPX-778').exists())
+        # A later run must not stall on the same vanished ID again.
+        again = self.restart(service).run(['7'], limit=5, scan_strategy='incremental')
+        self.assertFalse(again.get('stopped', False))
+        self.assertEqual(again['fail'], 0)
+
+    def test_vanished_movie_directory_mid_batch_does_not_block_later_directories(self):
+        m, cloud, _, service = self.library(entries=[
+            dict(id='7', parent_id='0', name='jav', is_dir=True),
+            dict(id='8', parent_id='7', name='IPX-201', is_dir=True),
+            dict(id='1', parent_id='8', name='IPX-201.mp4', pickcode='a'*17),
+            dict(id='9', parent_id='7', name='IPX-202', is_dir=True),
+            dict(id='2', parent_id='9', name='IPX-202.mp4', pickcode='b'*17),
+        ])
+        service.run(['7'], limit=1, scan_strategy='incremental')
+        del cloud.entries['8']
+        service = self.restart(service)
+        result = service.run(['7'], limit=5, scan_strategy='incremental')
+        self.assertFalse(result.get('stopped', False))
+        self.assertEqual(result['fail'], 0)
+        self.assertEqual(result['ok'], 1)
+        self.assertTrue((service.root/'IPX/IPX-202/IPX-202 - V0001.strm').is_file())
+
+    def test_unreadable_directory_still_pauses_and_keeps_position(self):
+        m, cloud, _, service = self.library(entries=[
+            dict(id='7', parent_id='0', name='jav', is_dir=True),
+            dict(id='8', parent_id='7', name='IPX-201', is_dir=True),
+            dict(id='1', parent_id='8', name='IPX-201.mp4', pickcode='a'*17),
+            dict(id='9', parent_id='7', name='IPX-202', is_dir=True),
+            dict(id='2', parent_id='9', name='IPX-202.mp4', pickcode='b'*17),
+        ])
+        service.run(['7'], limit=1, scan_strategy='incremental')
+        original = cloud.listdir
+        cloud.listdir = lambda cid: (_ for _ in ()).throw(m.CloudError('page changed')) if cid == '9' else original(cid)
+        failed = self.restart(service).run(['7'], limit=5, scan_strategy='incremental')
+        self.assertTrue(failed['stopped'])
+        self.assertIn('page changed', failed['scan_pause_reason'])
+
 
 class StrategyConfigurationTests(unittest.TestCase):
     def test_saved_strategy_is_normalized_and_legacy_configs_default_to_full(self):
@@ -438,6 +497,54 @@ class StrategyConfigurationTests(unittest.TestCase):
         page = str(plugin.get_page())
         for value in ('增量', '/jav/IPX-202', '达到单次上限'):
             self.assertIn(value, page)
+
+
+
+
+class MissingObjectClassificationTests(unittest.TestCase):
+    def test_missing_directory_codes_are_not_risk_or_generic_errors(self):
+        import test_metatube_direct as fixtures
+        m = fixtures.components()
+        for code in ('800001', '20009', '20013', '20018'):
+            with self.subTest(code=code):
+                sdk = types.SimpleNamespace(fs_file=Mock(return_value={
+                    'state': False, 'code': code, 'error': '目录不存在。'}))
+                client = m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+                with self.assertRaises(m.NotFoundError):
+                    client.info('3556154200469538309')
+                self.assertEqual(sdk.fs_file.call_count, 2, 'a missing object is retried once')
+
+    def test_risk_and_auth_codes_still_take_precedence_over_missing(self):
+        import test_metatube_direct as fixtures
+        m = fixtures.components()
+        sdk = types.SimpleNamespace(fs_file=Mock(return_value={'state': False, 'errno': 911}))
+        client = m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+        with self.assertRaises(m.RiskError):
+            client.info('1')
+
+    def test_listdir_falling_back_to_root_reports_missing_directory(self):
+        import test_metatube_direct as fixtures
+        m = fixtures.components()
+        sdk = types.SimpleNamespace(fs_files=Mock(return_value={
+            'state': True, 'count': 0, 'path': [{'cid': '0'}], 'data': []}))
+        client = m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+        with self.assertRaises(m.NotFoundError):
+            client.listdir('9')
+
+    def test_server_message_is_kept_for_localized_errors_only(self):
+        import test_metatube_direct as fixtures
+        m = fixtures.components()
+        sdk = types.SimpleNamespace(fs_files=Mock(return_value={
+            'state': False, 'errno': 990002, 'error': '参数错误。'}))
+        client = m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+        with self.assertRaises(m.CloudError) as caught:
+            client.listdir('0')
+        self.assertIn('参数错误。', str(caught.exception))
+        sdk.fs_files = Mock(return_value={'state': False, 'errno': 990003,
+                                          'error': 'https://115.com/?pickcode=private'})
+        with self.assertRaises(m.CloudError) as caught:
+            client.listdir('0')
+        self.assertNotIn('private', str(caught.exception))
 
 
 if __name__ == '__main__':
