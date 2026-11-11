@@ -1,12 +1,13 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.4.1",
+    "version": "1.4.2",
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
     "v3": true,
     "history": {
+      "v1.4.2": "清理 115 已永久删除的版本登记及可核验的 STRM；整理目标单选显示路径，支持选择要刷新的 MoviePilot 媒体服务器。",
       "v1.4.1": "首份影片使用纯番号，重复版本从 V0001 追加，跨视频格式统一避让并保留扩展名；存量 STRM／字幕与网盘文件逐片改名，保留内部版本、播放链接和中断恢复。",
       "v1.4.0": "新增厂商归并分类与可编辑别名、独立网盘整理目标；按登记逐片迁移并保留版本与播放链接，支持迁移恢复、文件来源保护及旧空目录核验清理。",
       "v1.3.0": "移除 115Lite 插件与 MetaTube 的 115Lite 兼容模式存储；旧配置启动时提示重新选择存储类型，其余模式与直连 STRM 生成不变。",

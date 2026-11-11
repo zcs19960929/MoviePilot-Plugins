@@ -153,6 +153,15 @@ JS_SCAN_CHANGE = """(values) => {
   scan_dirs = [...new Set(list.map(v => String((v && typeof v === 'object') ? (v.value || v.path || '') : v).trim()).filter(Boolean))].join('\\n');
 }"""
 
+JS_ARCHIVE_VALUE = "String((archive_root && typeof archive_root === 'object' ? archive_root.value : archive_root) || '').trim()"
+JS_DIRECTORY_ITEMS = "Object.entries(dir_labels || {}).map(([value, title]) => ({title, value}))"
+JS_ARCHIVE_OPTION = "((value) => value ? {title: (dir_labels || {})[value] || archive_root_label || value, value} : null)"
+JS_ARCHIVE_CHANGE = """(selection) => {
+  const value = String((selection && typeof selection === 'object' ? selection.value : selection) || '').trim();
+  if (value !== (""" + JS_ARCHIVE_VALUE + """)) archive_root_label = (dir_labels || {})[value] || '';
+  archive_root = value;
+}"""
+
 JS_LOAD = """async () => {
   dir_items = []; dir_page = 1;
   const requestItems = dir_items;
@@ -365,7 +374,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.4.1"
+    plugin_version = "1.4.2"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -408,6 +417,8 @@ class MetaTubeScraper(_PluginBase):
     _preview_limit = 10
     _rename_files = False
     _archive_loose = False
+    _refresh_library = False
+    _refresh_servers = ()
     _numeric_ids = False
     # v1.2 输出位置与归位
     _write_local = True
@@ -429,7 +440,8 @@ class MetaTubeScraper(_PluginBase):
             candidate.__read_config(config)
             changes = {key: value for key, value in vars(candidate).items()
                        if key not in before or (before[key] is not value and before[key] != value)}
-            execution_changes = changes.keys() - {"_schedule", "_schedule_error", "_dir_labels"}
+            execution_changes = changes.keys() - {"_schedule", "_schedule_error", "_dir_labels",
+                                                  "_refresh_library", "_refresh_servers"}
             if not self._config_loaded or execution_changes or self._stop_event.is_set():
                 if self._running:
                     self._stop_event.set()
@@ -510,6 +522,10 @@ class MetaTubeScraper(_PluginBase):
         self._library_layout = _pick_str(config.get('library_layout'), 'prefix')
         self._maker_groups = str(config.get('maker_groups', DEFAULT_MAKER_GROUPS))
         self._archive_root = _pick_str(config.get('archive_root'))
+        self._refresh_library = config.get('refresh_library') is True
+        servers = config.get('refresh_servers')
+        self._refresh_servers = tuple(dict.fromkeys(name.strip() for name in servers
+                                      if isinstance(name, str) and name.strip())) if isinstance(servers, list) else ()
         self._cleanup_empty_dirs = config.get('cleanup_empty_dirs', True) is True
         self._numeric_ids = bool(config.get("numeric_ids"))
         self._write_local = bool(config.get("write_local", True))
@@ -1303,7 +1319,7 @@ class MetaTubeScraper(_PluginBase):
                 stats.setdefault("errors", []).append(message)
             self.error(f"刮削任务异常: {e}")
         finally:
-            if stats.get('storage') == '115_direct' and stats.get('migrated'):
+            if stats.get('storage') == '115_direct' and (stats.get('library_changed') or stats.get('migrated')):
                 self.__refresh_migrated_library(stats)
             if task_stop_event.is_set():
                 stats["stopped"] = True
@@ -1330,10 +1346,14 @@ class MetaTubeScraper(_PluginBase):
             self.__scrape_all()
 
     def __refresh_migrated_library(self, stats):
-        """Ask configured host media servers to rescan after path migrations."""
+        """Refresh selected host media servers once per run with library changes."""
+        with self._direct_lock:
+            selected = self._refresh_servers
+            if not self._refresh_library or not selected:
+                return
         try:
             from app.helper.mediaserver import MediaServerHelper
-            services = MediaServerHelper().get_services()
+            services = MediaServerHelper().get_services(name_filters=list(selected)) or {}
         except ImportError:
             stats['library_refresh'] = '宿主未提供媒体服务器接口'
             self.warn(stats['library_refresh'])
@@ -1343,14 +1363,18 @@ class MetaTubeScraper(_PluginBase):
             self.warn(stats['library_refresh'])
             return
         results = []
-        for name, service in services.items():
+        for name in selected:
+            service = services.get(name)
+            if service is None:
+                results.append(name+'：宿主中找不到此媒体服务器')
+                continue
             try:
                 result = service.instance.refresh_root_library()
                 results.append(name+('：刷新请求失败' if result is False else '：已请求刷新'))
             except Exception as exc:
                 results.append(name+'：刷新请求异常（'+type(exc).__name__+'）')
-        stats['library_refresh'] = '；'.join(results) or '未配置媒体服务器'
-        self.info('迁移后媒体库刷新：'+stats['library_refresh'])
+        stats['library_refresh'] = '；'.join(results)
+        self.info('媒体库刷新：'+stats['library_refresh'])
 
     # ---------------- 插件契约 ----------------
 
@@ -1546,6 +1570,14 @@ class MetaTubeScraper(_PluginBase):
         legacy = f"(!{direct})"
         schedule = "((schedule_mode && typeof schedule_mode === 'object') ? schedule_mode.value : (schedule_mode || 'daily'))"
         timed = f"({schedule} === 'daily' || {schedule} === 'weekly')"
+        try:
+            from app.helper.mediaserver import MediaServerHelper
+            server_names = sorted(MediaServerHelper().get_configs())
+        except ImportError:
+            server_names = []
+        except Exception as exc:
+            self.warn('读取媒体服务器配置失败（'+type(exc).__name__+'）')
+            server_names = []
 
         def expr(code):
             return "{{ " + code + " }}"
@@ -1624,7 +1656,7 @@ class MetaTubeScraper(_PluginBase):
             row(col({"component": "VCombobox", "props": {
                 "model": "scan_dirs", "label": "扫描目录（可多选）",
                 "modelValue": expr(JS_SCAN_VALUES + ".map(value => ({title: (dir_labels || {})[value] || value, value}))"),
-                "items": expr("Object.entries(dir_labels || {}).map(([value, title]) => ({title, value}))"),
+                "items": expr(JS_DIRECTORY_ITEMS),
                 "multiple": True, "chips": True, "closableChips": True, "returnObject": True,
                 "itemTitle": "title", "itemValue": "value", "onUpdate:modelValue": JS_SCAN_CHANGE,
                 "hint": "点击选择目录，可添加多个；也可输入网盘路径。只扫描这里列出的目录，修改后请保存。",
@@ -1639,14 +1671,17 @@ class MetaTubeScraper(_PluginBase):
             row(switch("archive_loose", "网盘目录和文件按番号整理",
                        "视频和关联字幕归入所选分类／番号目录。",
                        show=direct)),
-            row(text('archive_root', '网盘整理目标目录', '留空跟随当前扫描归档根',
-                     '留空自动跟随扫描根；指定路径或 id:目录ID 后，多个扫描根可汇总到此处。', md=9,
-                     show=f'{direct} && archive_loose',
-                     **{'onUpdate:modelValue': "(value) => { archive_root = value || ''; archive_root_label = ''; }"}),
+            row(col({'component': 'VCombobox', 'props': {
+                'model': 'archive_root', 'label': '网盘整理目标目录',
+                'modelValue': expr(f"{JS_ARCHIVE_OPTION}({JS_ARCHIVE_VALUE})"),
+                'items': expr(JS_DIRECTORY_ITEMS),
+                'chips': True, 'closableChips': True, 'clearable': True, 'returnObject': True,
+                'itemTitle': 'title', 'itemValue': 'value', 'onUpdate:modelValue': JS_ARCHIVE_CHANGE,
+                'hint': '可选择目录或手填网盘路径。留空跟随扫描根，指定目标可汇总多个扫描根。',
+                'persistent-hint': True,
+            }}, md=9, show=f'{direct} && archive_loose'),
                 button('选择整理目录', JS_ARCHIVE_PICK_OPEN, icon='mdi-folder-open-outline', md=3,
                        show=f'{direct} && archive_loose')),
-            row(text('archive_root_label', '整理目标名称', md=12, readonly=True,
-                     show=f'{direct} && archive_loose && !!archive_root && !!archive_root_label')),
             row(col({'component':'VSelect', 'props': {
                 'model':'library_layout', 'label':'媒体库分类', 'returnObject':False,
                 'items':[{'title':'番号前缀','value':'prefix'}, {'title':'厂商归并','value':'maker'}],
@@ -1659,6 +1694,13 @@ class MetaTubeScraper(_PluginBase):
             }}, md=12, show=f"{direct} && library_layout === 'maker'")),
             row(switch('cleanup_empty_dirs', '迁移后清理旧空目录',
                        '仅清理本次迁空的旧影片／分类目录；网盘移入回收站。同目录有其他写入任务时请关闭。', show=direct)),
+            row(switch('refresh_library', '媒体服务器刷新',
+                       '生成、迁移或清理 STRM 后，通知选中的媒体服务器。', show=direct),
+                col({'component': 'VSelect', 'props': {
+                    'model': 'refresh_servers', 'label': '媒体服务器', 'items': server_names,
+                    'multiple': True, 'chips': True, 'closableChips': True, 'returnObject': False,
+                    'hint': '从 MoviePilot 已配置的服务器中选择，留空时跳过刷新。', 'persistent-hint': True,
+                }}, show=f'{direct} && refresh_library')),
             alert("按所选分类／番号生成本地媒体库；同番号多个版本共用 NFO 和图片，字幕、分段跟随对应版本。", direct),
             {"component": "VDialog", "props": {
                 "model": "dir_picker_open", "maxWidth": 800, "width": "calc(100% - 32px)",
@@ -1773,6 +1815,7 @@ class MetaTubeScraper(_PluginBase):
             "archive_loose": False,
             'library_layout':'prefix', 'maker_groups':DEFAULT_MAKER_GROUPS, 'archive_root':'',
             'archive_root_label':'', 'cleanup_empty_dirs':True, 'dir_picker_purpose':'scan',
+            'refresh_library': False, 'refresh_servers': [],
             "cookie115_msg": "", "cookie115_checking": False, "cookie115_check_id": 0,
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,

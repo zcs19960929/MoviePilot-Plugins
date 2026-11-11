@@ -162,6 +162,8 @@ class NamingManager:
                     raise CheckpointError('本地改名未完成（'+type(exc).__name__+'），保留日志') from None
                 item['phase'] = 'staged' if phase == 'planned' else 'done'
                 self.save(number, job)
+                if Path(item['target']).suffix == '.strm':
+                    self.s._library_changed.add(number)
         changed = local_changed
         if cloud:
             managed = {item['entry']['id'] for v in self.r.versions(*self.identity, number) for item in v['files']}

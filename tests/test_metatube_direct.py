@@ -471,6 +471,20 @@ class DirectAcceptanceTests(unittest.TestCase):
 
 
 class AdapterTests(unittest.TestCase):
+    def test_file_info_distinguishes_a_permanent_deletion_from_a_live_file(self):
+        for version in ('v2', 'v3'):
+            m = components(version)
+            sdk = types.SimpleNamespace(fs_file=Mock(side_effect=[
+                {'state': True, 'data': [{'fid': '7', 'cid': '0', 'n': 'IPX-201.mp4', 'aid': '120'}]},
+                {'state': True, 'data': [{'fid': '7', 'cid': '0', 'n': 'IPX-201.mp4', 'aid': 1}]},
+            ]))
+            client = m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+            with self.subTest(version=version):
+                with self.assertRaises(m.NotFoundError):
+                    client.info('7')
+                self.assertEqual(client.info('7').name, 'IPX-201.mp4')
+                self.assertEqual(sdk.fs_file.call_count, 2)
+
     def test_numeric_category_directory_is_allowed_without_accepting_paths(self):
         for version in ("v2", "v3"):
             m = components(version)

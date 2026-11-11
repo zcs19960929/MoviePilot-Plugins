@@ -28,6 +28,10 @@ class NotFoundError(CloudError):
     """The object is gone (deleted, recycled or never existed), not unreadable."""
 
 
+class PermanentlyDeleted(NotFoundError):
+    """115 returned the retained details of a permanently deleted file."""
+
+
 @dataclass(frozen=True)
 class Entry:
     id: str
@@ -258,9 +262,12 @@ class Cloud115:
         data = response.get("data") or []
         if not data:
             raise CloudError("115 文件不存在或不可访问")
-        entry = self._entry(data[0] if isinstance(data, list) else data)
+        raw = data[0] if isinstance(data, list) else data
+        entry = self._entry(raw)
         if entry.id != str(fid):
             raise CloudError("115 返回了不同的文件 ID")
+        if str(raw.get("aid")) == "120":
+            raise PermanentlyDeleted("115 文件已永久删除")
         return entry
 
     def resolve_folder(self, value):

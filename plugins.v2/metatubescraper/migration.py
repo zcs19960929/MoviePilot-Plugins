@@ -77,7 +77,10 @@ class MigrationManager:
             LEFT JOIN library_policies p USING(account,root,number)
             LEFT JOIN library_migrations j USING(account,root,number)
             LEFT JOIN library_migration_attempts a USING(account,root,number)
-            WHERE m.account=? AND m.root=? ORDER BY m.rowid''', self.identity)
+            WHERE m.account=? AND m.root=? AND EXISTS (
+                SELECT 1 FROM library_versions v
+                WHERE v.account=m.account AND v.root=m.root AND v.number=m.number
+            ) ORDER BY m.rowid''', self.identity)
         pending = []
         for row in rows:
             if row['cycle'] == cycle:
@@ -87,6 +90,86 @@ class MigrationManager:
                 pending.append((0 if plan and plan['stage'] != 'done' else 1, row['number']))
         for _, number in sorted(pending, key=lambda item:item[0]):
             yield number
+
+    def retire_deleted(self, number, version, deleted):
+        """Retire confirmed deletions and their owned outputs before planning a rename."""
+        self.service._stopped()
+        owner = self.service._version_owner(number, version)
+        account, root = self.identity
+        key = (account, root, number, version)
+        with self.registry._lock, self.registry.db:
+            self.registry.check_identity()
+            db = self.registry.db
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT files FROM library_versions WHERE account=? AND root=? AND number=? AND version=?',
+                             key).fetchone()
+            if row is None:
+                return deleted
+            files = json.loads(row['files'])
+            surviving = [item for item in files if item['entry']['id'] not in deleted]
+            videos = [item for item in surviving if item['kind'] == 'video']
+            if not videos:
+                surviving = []
+            else:
+                gone_stems = tuple(Path(item['target']).stem.casefold() + '.' for item in files
+                                   if item['kind'] == 'video' and item['entry']['id'] in deleted)
+                live_stems = tuple(Path(item['target']).stem.casefold() + '.' for item in videos)
+                surviving = [item for item in surviving if item['kind'] == 'video'
+                             or not item['target'].casefold().startswith(gone_stems)
+                             or item['target'].casefold().startswith(live_stems)]
+            retired = [item for item in files if item not in surviving]
+            retired_ids = {item['entry']['id'] for item in retired}
+            names = {Path(item['target']).stem + '.strm' if item['kind'] == 'video' else item['target']
+                     for item in retired}
+            plan = self.plan(number)
+            paths = set()
+            if plan:
+                naming = plan.get('naming') or {}
+                local = naming.get('local', [])
+                # Renaming can leave a reserved output at its old name or temporary path.
+                retired_moves = [item for item in local if item['owner'] == owner and (
+                    not surviving or Path(item['target']).name in names or Path(item['source']).name in names)]
+                paths.update(item[field] for item in retired_moves for field in ('source', 'temp', 'target'))
+                if naming:
+                    naming['local'] = [item for item in local if item not in retired_moves]
+                    naming['cloud'] = [item for item in naming['cloud'] if item['id'] not in retired_ids]
+                plan['local'] = [item for item in plan.get('local', []) if not (
+                    item['owner'] == owner and (not surviving or Path(item['source']).name in names or item['source'] in paths))]
+                plan['cloud_files'] = [item for item in plan.get('cloud_files', []) if item['id'] not in retired_ids]
+                db.execute('UPDATE library_migrations SET plan=? WHERE account=? AND root=? AND number=?',
+                           (json.dumps(plan, ensure_ascii=False), account, root, number))
+            rows = list(db.execute('SELECT path FROM outputs WHERE account=? AND job=?', (account, owner)))
+            for output in rows:
+                path = Path(output['path'])
+                if surviving and path.name not in names and str(path) not in paths:
+                    continue
+                self.service._stopped()
+                try:
+                    self.registry.check_output(path, account, owner)
+                except CloudError:
+                    self.service._info('保留无法核验的旧版本输出：'+str(path))
+                else:
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError as exc:
+                        raise CheckpointError('旧版本输出清理未完成（'+type(exc).__name__+'）') from None
+                db.execute('DELETE FROM outputs WHERE path=? AND account=? AND job=?', (str(path), account, owner))
+            if surviving:
+                db.execute('UPDATE library_versions SET files=? WHERE account=? AND root=? AND number=? AND version=?',
+                           (json.dumps(surviving, ensure_ascii=False), *key))
+            else:
+                db.execute('DELETE FROM library_versions WHERE account=? AND root=? AND number=? AND version=?', key)
+                db.execute('DELETE FROM library_version_names WHERE account=? AND root=? AND number=? AND version=?', key)
+            db.executemany('DELETE FROM library_files WHERE account=? AND root=? AND fid=?',
+                           [(account, root, fid) for fid in retired_ids])
+            db.executemany('DELETE FROM library_origins WHERE account=? AND root=? AND fid=?',
+                           [(account, root, fid) for fid in retired_ids])
+            db.executemany('DELETE FROM media WHERE account=? AND fid=?', [(account, fid) for fid in deleted])
+            if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='media_aliases'").fetchone():
+                db.executemany('DELETE FROM media_aliases WHERE account=? AND fid=?', [(account, fid) for fid in deleted])
+        self.service._library_changed.add(number)
+        self.service._info(f'已清理永久删除文件的登记 番号={number} 版本={version} 文件ID={sorted(deleted)!r}')
+        return retired_ids
 
     def categories(self):
         rows = self.registry.db.execute('SELECT relative_dir FROM library_movies WHERE account=? AND root=?', self.identity)

@@ -297,7 +297,7 @@ class LibraryAcceptanceTests(unittest.TestCase):
             self.assertFalse((service.root/'IPX/IPX-922/IPX-922.strm').exists())
             self.assertTrue((service.root/'IPX/IPX-922/IPX-922 - V0001.strm').exists())
             self.assertEqual(service.registry.media(cloud.account,token).id,'1')
-            self.assertFalse(any(call.args==('1',) for call in cloud.info.call_args_list))
+            self.assertEqual(cloud.info.call_args_list.count(unittest.mock.call('1')), 1)
 
 
     def test_archive_toggle_keeps_tracked_subtitle_after_partial_move(self):

@@ -28,10 +28,37 @@ class HostTests(unittest.TestCase):
         helper = types.ModuleType('app.helper.mediaserver')
         helper.MediaServerHelper = Mock(side_effect=RuntimeError('host unavailable'))
         plugin = load_plugin('v3', Mock())
+        plugin.init_plugin(dict(storage='115_direct', refresh_library=True, refresh_servers=['jellyfin']))
         stats = {}
         with patch.dict('sys.modules', {'app.helper.mediaserver':helper}):
             plugin._MetaTubeScraper__refresh_migrated_library(stats)
         self.assertIn('RuntimeError', stats['library_refresh'])
+
+    def test_strm_publication_refreshes_only_selected_servers(self):
+        for version in ('v2', 'v3'):
+            for enabled, selected, expected in ((True, ['jellyfin'], 1), (True, [], 0), (False, ['jellyfin'], 0)):
+                with self.subTest(version=version, enabled=enabled, selected=selected):
+                    jellyfin, navidrome = Mock(), Mock()
+                    helper = types.ModuleType('app.helper.mediaserver')
+                    helper.MediaServerHelper = Mock()
+                    helper.MediaServerHelper.return_value.get_services.return_value = {
+                        'jellyfin': types.SimpleNamespace(instance=jellyfin),
+                        'navidrome': types.SimpleNamespace(instance=navidrome),
+                    }
+                    plugin = load_plugin(version, Mock())
+                    plugin.init_plugin(dict(storage='115_direct', refresh_library=enabled,
+                                            refresh_servers=selected))
+                    plugin._direct_service = types.SimpleNamespace(run=Mock(return_value=dict(ok=1, library_changed=1)))
+                    plugin.save_data = Mock()
+                    with patch.dict('sys.modules', {'app.helper.mediaserver':helper}):
+                        plugin._MetaTubeScraper__scrape_all()
+                    self.assertEqual(jellyfin.refresh_root_library.call_count, expected)
+                    navidrome.refresh_root_library.assert_not_called()
+                    get_services = helper.MediaServerHelper.return_value.get_services
+                    if expected:
+                        get_services.assert_called_once_with(name_filters=['jellyfin'])
+                    else:
+                        get_services.assert_not_called()
 
     def test_direct_scan_logs_readable_root_and_number_without_extra_cloud_reads(self):
         for version in ("v2", "v3"):
