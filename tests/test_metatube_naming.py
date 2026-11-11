@@ -1,6 +1,7 @@
 """Display names are independent of registered version and playback identity."""
 import dataclasses
 import sqlite3
+import types
 import unittest
 from dataclasses import asdict
 from pathlib import Path
@@ -62,6 +63,15 @@ class NamingTests(unittest.TestCase):
             service.registry.db.execute('UPDATE library_movies SET cloud_root=?,cloud_folder=?',('77',destination))
         return service, folder, destination
 
+    def permanently_delete(self, fid):
+        gone = self.cloud.entries.pop(fid)
+        sdk = types.SimpleNamespace(fs_file=Mock(return_value={'state': True, 'data': [
+            {'fid': fid, 'cid': '0', 'n': gone.name, 'aid': 120},
+        ]}))
+        client = self.m.Cloud115('UID=12345_A1; CID=fixture; SEID=fixture', sdk=sdk, interval=0)
+        info = self.cloud.info
+        self.cloud.info = lambda key: client.info(key) if key == fid else info(key)
+
     def test_first_copy_is_plain_and_extensions_are_preserved(self):
         self.cloud.entries['1'] = dataclasses.replace(self.cloud.info('1'),name='IPX-201.MP4')
         service = self.service(target='id:77')
@@ -119,6 +129,58 @@ class NamingTests(unittest.TestCase):
         self.assertEqual([self.cloud.info(fid).name for fid in ('1','3')],['IPX-201.mp4','IPX-201 - V0001.AVI'])
         self.assertEqual([(folder/name).read_bytes() for name in ('IPX-201.strm','IPX-201 - V0001.strm')],links)
         self.assertEqual([v['version'] for v in service.registry.versions(self.cloud.account,service.root,'IPX-201')],[1,2])
+
+    def test_migration_retires_permanently_deleted_version_and_keeps_live_playback(self):
+        old, folder, _ = self.legacy(2, second_ext='.mp4')
+        live = (folder/'IPX-201 - V0001.strm').read_bytes()
+        stale = folder/'IPX-201 - V0002.strm'
+        token = stale.read_text().strip().split('media_id=')[1]
+        old.close()
+        self.permanently_delete('3')
+        self.cloud.rename('1', 'IPX-201.mp4')
+        service = self.service(target='id:77')
+        result = service.run(['7'])
+        self.assertEqual(result['fail'], 0, result)
+        self.assertEqual(result['library_changed'], 1)
+        self.assertFalse(stale.exists())
+        self.assertIsNone(service.registry._output(stale))
+        self.assertIsNone(service.registry.db.execute('SELECT token FROM media WHERE token=?', (token,)).fetchone())
+        self.assertEqual((folder/'IPX-201.strm').read_bytes(), live)
+        versions = service.registry.versions(self.cloud.account, service.root, 'IPX-201')
+        self.assertEqual([row['version'] for row in versions], [1])
+        self.assertEqual(service.run(['7'])['library_changed'], 0)
+
+    def test_normal_scan_retires_deleted_copy_but_keeps_manually_edited_strm(self):
+        del self.cloud.entries['2']
+        self.cloud.entries['3'] = self.m.Entry('3', '7', 'IPX-201 alternate.mp4', pickcode='c'*17)
+        service = self.service(archive=False)
+        first = service.run(['7'])
+        self.assertEqual(first['ok'], 1, first)
+        self.assertEqual(first['library_changed'], 1)
+        folder = service.root/'IDEA POCKET/IPX-201'
+        live = (folder/'IPX-201.strm').read_bytes()
+        edited = folder/'IPX-201 - V0001.strm'
+        token = edited.read_text().strip().split('media_id=')[1]
+        edited.write_bytes(b'manually edited')
+        self.permanently_delete('3')
+
+        result = service.run(['7'])
+        self.assertEqual(result['fail'], 0, result)
+        self.assertEqual(result['library_changed'], 1)
+        self.assertEqual(edited.read_bytes(), b'manually edited')
+        self.assertIsNone(service.registry._output(edited))
+        self.assertIsNone(service.registry.db.execute('SELECT token FROM media WHERE token=?', (token,)).fetchone())
+        self.assertEqual((folder/'IPX-201.strm').read_bytes(), live)
+
+    def test_ambiguous_missing_file_does_not_retire_version(self):
+        old, folder, _ = self.legacy(2)
+        old.close()
+        del self.cloud.entries['3']
+        service = self.service(target='id:77')
+        result = service.run(['7'])
+        self.assertEqual(result['fail'], 1, result)
+        self.assertTrue((folder/'IPX-201 - V0002.strm').is_file())
+        self.assertEqual(len(service.registry.versions(self.cloud.account, service.root, 'IPX-201')), 2)
 
     def test_unowned_local_strm_reserves_the_slot_without_being_adopted(self):
         service = self.service(target='id:77')

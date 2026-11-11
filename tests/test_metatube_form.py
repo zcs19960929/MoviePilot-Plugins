@@ -45,6 +45,31 @@ class FormTests(unittest.TestCase):
                                archive_picker_flow={'cancelPending':True})
             self.assertEqual(late['model']['archive_root'], '')
 
+    def test_archive_directory_shows_one_labeled_value_and_supports_clear_and_manual_input(self):
+        for version in ('v2', 'v3'):
+            result = self.render(version, archive_loose=True, archive_root='id:88',
+                                 archive_root_label='/旧配置路径', changes=[
+                                     {'field':'archive_root', 'value':None},
+                                     {'field':'archive_root', 'value':'/手填路径'},
+                                 ])
+            fields = result['snapshots'][0]
+            self.assertNotIn('archive_root_label', fields)
+            self.assertEqual(fields['archive_root']['modelValue'], {'title':'/旧配置路径', 'value':'id:88'})
+            self.assertIsNone(result['snapshots'][1]['archive_root']['modelValue'])
+            self.assertEqual(result['model']['archive_root'], '/手填路径')
+
+    def test_refresh_selector_lists_host_servers_and_is_hidden_by_default(self):
+        helper = types.ModuleType('app.helper.mediaserver')
+        helper.MediaServerHelper = Mock()
+        helper.MediaServerHelper.return_value.get_configs.return_value = {'navidrome': None, 'jellyfin': None}
+        with patch.dict('sys.modules', {'app.helper.mediaserver': helper}):
+            for version in ('v2', 'v3'):
+                result = self.render(version, changes=[{'field':'refresh_library', 'value':True}])
+                self.assertNotIn('refresh_servers', result['snapshots'][0])
+                field = result['snapshots'][-1]['refresh_servers']
+                self.assertEqual(field['items'], ['jellyfin', 'navidrome'])
+                self.assertTrue(field['multiple'])
+
     def test_scan_strategy_is_direct_only_and_depth_keeps_its_saved_key(self):
         for version in ('v2', 'v3'):
             for storage in ('115_direct', {'value':'115_direct'}):

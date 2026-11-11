@@ -14,7 +14,7 @@ from dataclasses import asdict
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from .cloud115 import AuthenticationError, CloudError, Entry, NotFoundError, RiskError, Stopped
+from .cloud115 import AuthenticationError, CloudError, Entry, NotFoundError, PermanentlyDeleted, RiskError, Stopped
 from .direct import PlaybackService, Registry, SUBTITLE_EXTS, VIDEO_EXTS, _part, checked_path, digest
 from .scan_progress import CheckpointError, ScanProgress
 from .classification import ClassificationPolicy, directory_name
@@ -504,6 +504,8 @@ class LibraryService(PlaybackService):
         owners = {movie_job(self.root, number)} | {version_job(self.root, number, version['version'])
                                                 for version in self.registry.versions(account, self.root, number)}
         relocated = self.migrations.relocate_local(number, relative, owners)
+        if relocated:
+            self._library_changed.add(number)
         self.registry.ensure_movie(account, self.root, number, relative, info)
         folder = self._folder(number)
         identity = folder.stat()
@@ -586,6 +588,8 @@ class LibraryService(PlaybackService):
             for path, content, owner in data:
                 if not path.exists() or path.read_bytes()!=content:
                     self._publish(folder, identity, path, content, owner, staged[path])
+                    if path.suffix == '.strm':
+                        self._library_changed.add(number)
                 else:
                     self.registry.published(path, content)
         self._info(f'本地媒体生成完成 番号={number} 路径={str(folder)!r}')
@@ -1019,6 +1023,9 @@ class LibraryService(PlaybackService):
                 continue
             try:
                 entry = live.get(fid) or self.client.info(fid)
+            except PermanentlyDeleted:
+                context.setdefault('permanently_deleted', set()).add(fid)
+                continue
             except (AuthenticationError, RiskError, Stopped):
                 raise
             except Exception:
@@ -1083,9 +1090,11 @@ class LibraryService(PlaybackService):
         present.update(entry.id for entry in context['entries'] if Path(entry.name).suffix.lower() in SUBTITLE_EXTS)
         plans = self.registry.versions(self.client.account, self.root, number)
         checked = set()
+        permanently_deleted = context.get('permanently_deleted', set())
         scanned_videos = {entry.id for entry in context['videos']}
         fresh_parts = {_source_key(entry) for entry in context['videos'] if _part(entry.name)}
         for plan in plans:
+            deleted, resolved = set(), []
             active_version = any(item['entry']['id'] in present for item in plan['files'])
             active_version = active_version or any(
                 item['kind'] == 'video' and (
@@ -1094,20 +1103,38 @@ class LibraryService(PlaybackService):
                     (not scanned_videos and item.get('source_parent', item['entry']['parent_id']) == context['directory']))
                 for item in plan['files'])
             for item in plan['files']:
+                fid = item['entry']['id']
+                if fid in permanently_deleted:
+                    deleted.add(fid)
+                    continue
                 # Local publication can be complete while a subtitle remains in
                 # its source directory after an interrupted/disabled archive.
-                if plan['complete'] and not active_version:
+                if (plan['complete'] and not active_version
+                        and item['entry']['parent_id'] != context['directory']):
                     continue
-                fid = item['entry']['id']
                 if fid in present or fid in checked:
                     continue
                 checked.add(fid)
                 try:
                     entry = self.client.info(fid)
+                except PermanentlyDeleted:
+                    deleted.add(fid)
+                    continue
                 except (AuthenticationError, RiskError, Stopped):
                     raise
                 except Exception:
                     self._error(f"历史登记文件不可用 番号={number} 原文件名={item['entry']['name']!r} 文件ID={fid} 原父目录={item['entry']['parent_id']}")
+                    continue
+                resolved.append((item, entry))
+            retired = self.migrations.retire_deleted(number, plan['version'], deleted) if deleted else set()
+            if retired:
+                context['videos'] = [entry for entry in context['videos'] if entry.id not in retired]
+                context['entries'] = [entry for entry in context['entries'] if entry.id not in retired]
+            if plan['complete'] and not active_version:
+                continue
+            for item, entry in resolved:
+                fid = entry.id
+                if fid in retired:
                     continue
                 if entry.is_dir or not self._entry_allowed(entry, number, context['root']):
                     self._error(f"历史登记文件位于扫描范围外 番号={number} 原文件名={entry.name!r} 文件ID={fid} 当前父目录={entry.parent_id}")
@@ -1204,36 +1231,45 @@ class LibraryService(PlaybackService):
         """Resolve owned file identities without discovering destination subtrees."""
         movie = self.registry.movie(self.client.account, self.root, number)
         source_roots, videos, entries = set(), [], []
+        resolved = []
         for version in self.registry.versions(self.client.account, self.root, number):
+            deleted, found = set(), []
             for item in version['files']:
                 self._stopped()
-                entry = self.client.info(item['entry']['id'])
+                fid = item['entry']['id']
+                try:
+                    found.append((item, self.client.info(fid)))
+                except PermanentlyDeleted:
+                    deleted.add(fid)
+            retired = self.migrations.retire_deleted(number, version['version'], deleted) if deleted else set()
+            resolved.extend((item, entry) for item, entry in found if entry.id not in retired)
+        for item, entry in resolved:
+            origin = self.migrations.origin(entry.id)
+            if origin is None:
+                # Legacy rows have no authorization to an external target.
+                original_parent = item.get('source_parent', entry.parent_id)
+                try:
+                    ancestors = self._ancestors(original_parent)
+                except DirectoryGone:
+                    raise CloudError('旧登记来源无法核验，已跳过：'+entry.name) from None
+                selected = self._scan_root_ids.intersection(ancestors)
+                if not selected:
+                    raise CloudError('旧登记来源无法核验，已跳过：'+entry.name)
+                source = next(cid for cid in ancestors if cid in selected)
+                source_root = self._scan_archive_roots[source]
+                self.migrations.record_origin(entry, source_root, ancestors)
                 origin = self.migrations.origin(entry.id)
-                if origin is None:
-                    # Legacy rows have no authorization to an external target.
-                    original_parent = item.get('source_parent', entry.parent_id)
-                    try:
-                        ancestors = self._ancestors(original_parent)
-                    except DirectoryGone:
-                        raise CloudError('旧登记来源无法核验，已跳过：'+entry.name) from None
-                    selected = self._scan_root_ids.intersection(ancestors)
-                    if not selected:
-                        raise CloudError('旧登记来源无法核验，已跳过：'+entry.name)
-                    source = next(cid for cid in ancestors if cid in selected)
-                    source_root = self._scan_archive_roots[source]
-                    self.migrations.record_origin(entry, source_root, ancestors)
-                    origin = self.migrations.origin(entry.id)
-                if not self._origin_allowed(origin):
-                    raise CloudError('来源已从扫描目录移除，冻结迁移：'+entry.name)
-                origin_root = self._origin_root(origin, number)
-                source_roots.add(origin_root)
-                if not self._entry_allowed(entry, number, origin_root):
-                    raise CloudError('已登记文件实际位置无法核验；独立扫描根请选择共同上级或配置统一目标：'+entry.name)
-                if entry.is_dir or (self.extract_number(entry.name) not in (None, number) and not self.naming.is_pending(number,entry)):
-                    raise CloudError('已登记文件身份或番号变化：'+entry.name)
-                entries.append(entry)
-                if item['kind'] == 'video':
-                    videos.append(entry)
+            if not self._origin_allowed(origin):
+                raise CloudError('来源已从扫描目录移除，冻结迁移：'+entry.name)
+            origin_root = self._origin_root(origin, number)
+            source_roots.add(origin_root)
+            if not self._entry_allowed(entry, number, origin_root):
+                raise CloudError('已登记文件实际位置无法核验；独立扫描根请选择共同上级或配置统一目标：'+entry.name)
+            if entry.is_dir or (self.extract_number(entry.name) not in (None, number) and not self.naming.is_pending(number,entry)):
+                raise CloudError('已登记文件身份或番号变化：'+entry.name)
+            entries.append(entry)
+            if item['kind'] == 'video':
+                videos.append(entry)
         if len(source_roots) > 1 and self.archive_loose and self._archive_id is None:
             raise CloudError('独立扫描根的版本需要配置共同网盘整理目标')
         context['root'] = next(iter(source_roots), movie['cloud_root'])
@@ -1259,6 +1295,7 @@ class LibraryService(PlaybackService):
         stats['library_layout'] = self.policy.layout
         stats['archive_target'] = self.archive_root or '跟随各扫描归档根'
         stats['migrated'] = len(self._migrated)
+        stats['library_changed'] = len(self._library_changed)
         stats['scan_next_position'] = ('配置扫描根目录（全量从头）' if stats['scan_strategy'] == 'full'
                                        else self._next_position())
         if stats['scan_cycle_complete']:
@@ -1272,7 +1309,7 @@ class LibraryService(PlaybackService):
                      scan_strategy=strategy, scan_resumed=False, scan_cycle_complete=False, scan_pause_reason='')
         self._metadata_cache, self._artwork_cache = {}, {}
         self._refreshed_subtitles, self._attempted = set(), set()
-        self._migrated = set()
+        self._migrated, self._library_changed = set(), set()
         self._scan_state = None
         try:
             self._stopped()
