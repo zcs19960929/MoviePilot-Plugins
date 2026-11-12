@@ -1,0 +1,166 @@
+name: Release MetaTubeScraper
+
+# 版本号以 plugins.v3/metatubescraper/__init__.py 的 plugin_version 为准。
+# 推送 main 后：跑测试 → 校验清单 → 打包 → 若该版本尚无 Release 则自动打标签发布；
+# 同版本已发布时跳过，需要替换附件请手动运行并勾选 force。
+on:
+  push:
+    branches: [main]
+    paths:
+      - "plugins.v3/metatubescraper/**"
+      - "plugins.v2/metatubescraper/**"
+      - "package.v2.json"
+      - "package.v3.json"
+      - "tests/**"
+      - "scripts/release/**"
+      - ".github/workflows/release-metatube.yml"
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "同版本 Release 已存在时，重新上传附件并更新说明"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-metatube
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 解析运行参数
+        id: flags
+        shell: bash
+        env:
+          DISPATCH_FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+        run: |
+          set -euo pipefail
+          if [ "${DISPATCH_FORCE}" = "true" ]; then
+            echo "force=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "force=false" >> "${GITHUB_OUTPUT}"
+          fi
+          echo "运行来源 ${GITHUB_EVENT_NAME}，force=${DISPATCH_FORCE:-false}"
+
+      - name: 读取版本并校验清单
+        id: meta
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^    plugin_version = "\([^"]*\)".*/\1/p' \
+            plugins.v3/metatubescraper/__init__.py | head -n 1)
+          if [ -z "${VERSION}" ]; then
+            echo "::error::无法从 plugins.v3/metatubescraper/__init__.py 读取 plugin_version"
+            exit 1
+          fi
+          python3 scripts/release/release.py check "${VERSION}"
+          TAG="MetaTubeScraper_v${VERSION}"
+          ASSET="$(printf '%s' "${TAG}" | tr '[:upper:]' '[:lower:]').zip"
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+          echo "asset=${ASSET}" >> "${GITHUB_OUTPUT}"
+          echo "版本 ${VERSION}｜标签 ${TAG}｜附件 ${ASSET}"
+          if ! diff -q plugins.v2/metatubescraper/__init__.py \
+                      plugins.v3/metatubescraper/__init__.py >/dev/null; then
+            echo "::warning::V2 与 V3 的 __init__.py 不一致，发布包以 V3 为准"
+          fi
+
+      - name: 运行测试
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m venv .venv-ci
+          . .venv-ci/bin/activate
+          pip install --quiet --disable-pip-version-check starlette apscheduler
+          python -m unittest discover -s tests -p "test_*.py"
+
+      - name: 打包并自检
+        shell: bash
+        run: |
+          set -euo pipefail
+          ASSET="${{ steps.meta.outputs.asset }}"
+          mkdir -p dist
+          ( cd plugins.v3/metatubescraper && \
+            zip -r -X -q "${GITHUB_WORKSPACE}/dist/${ASSET}" . \
+              -x "__pycache__/*" "*.pyc" )
+          python3 scripts/release/release.py verify-asset \
+            "dist/${ASSET}" "${{ steps.meta.outputs.version }}"
+          ls -l "dist/${ASSET}"
+
+      - name: 生成 Release 说明
+        shell: bash
+        run: python3 scripts/release/release.py notes \
+          "${{ steps.meta.outputs.version }}" dist/release-notes.md
+
+      - name: 检查同版本 Release
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${{ steps.meta.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "${GITHUB_OUTPUT}"
+            echo "Release ${{ steps.meta.outputs.tag }} 已存在"
+          else
+            echo "exists=false" >> "${GITHUB_OUTPUT}"
+            echo "Release ${{ steps.meta.outputs.tag }} 尚未创建"
+          fi
+
+      - name: 已存在则跳过
+        if: steps.existing.outputs.exists == 'true' && steps.flags.outputs.force != 'true'
+        shell: bash
+        run: echo "::notice::${{ steps.meta.outputs.tag }} 已发布，跳过。需要重传请手动运行并勾选 force。"
+
+      - name: 重新上传附件
+        if: steps.existing.outputs.exists == 'true' && steps.flags.outputs.force == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "${{ steps.meta.outputs.tag }}" \
+            "dist/${{ steps.meta.outputs.asset }}" --clobber
+          gh release edit "${{ steps.meta.outputs.tag }}" \
+            --notes-file dist/release-notes.md
+          echo "::notice::已重新上传 ${{ steps.meta.outputs.asset }}"
+
+      - name: 创建 Release
+        if: steps.existing.outputs.exists == 'false'
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.meta.outputs.tag }}"
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            TARGET=(--verify-tag)
+          else
+            TARGET=(--target "${GITHUB_SHA}")
+          fi
+          gh release create "${TAG}" \
+            "dist/${{ steps.meta.outputs.asset }}" \
+            "${TARGET[@]}" \
+            --title "MetaTube 番号刮削 v${{ steps.meta.outputs.version }}" \
+            --notes-file dist/release-notes.md
+          echo "::notice::已发布 ${TAG}"
+
+      - name: 汇总
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### MetaTubeScraper 发布结果"
+            echo ""
+            echo "- 版本：\`${{ steps.meta.outputs.version }}\`"
+            echo "- 标签：\`${{ steps.meta.outputs.tag }}\`"
+            echo "- 附件：\`${{ steps.meta.outputs.asset }}\`"
+            echo "- 同版本 Release 已存在：\`${{ steps.existing.outputs.exists }}\`"
+            echo "- force：\`${{ steps.flags.outputs.force }}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
