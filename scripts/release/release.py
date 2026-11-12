@@ -45,7 +45,8 @@ def asset_for(version: str) -> str:
 
 
 def cmd_check(args: argparse.Namespace) -> None:
-    version = args.version or read_version()
+    # 参数可能来自 YAML 折叠或手工输入，统一去空白后再比对。
+    version = (args.version or read_version()).strip()
     problems = []
     for name in ("package.v2.json", "package.v3.json"):
         path = pathlib.Path(name)
@@ -68,6 +69,7 @@ def cmd_check(args: argparse.Namespace) -> None:
 
 
 def cmd_verify_asset(args: argparse.Namespace) -> None:
+    version = args.version.strip()
     path = pathlib.Path(args.archive)
     if not path.is_file():
         _fail(f"发布包不存在：{path}")
@@ -88,15 +90,16 @@ def cmd_verify_asset(args: argparse.Namespace) -> None:
         )
     if not declared:
         _fail("压缩包内的 __init__.py 缺少 plugin_version")
-    if declared.group(1) != args.version:
-        _fail(f"压缩包内 plugin_version={declared.group(1)} 与标签版本 {args.version} 不一致")
-    print(f"发布包自检通过：{path.name}，{len(names)} 个文件，版本 {args.version}")
+    if declared.group(1) != version:
+        _fail(f"压缩包内 plugin_version={declared.group(1)} 与标签版本 {version} 不一致")
+    print(f"发布包自检通过：{path.name}，{len(names)} 个文件，版本 {version}")
 
 
 def cmd_notes(args: argparse.Namespace) -> None:
+    version = args.version.strip()
     changelog = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
     match = re.search(
-        rf"^## {re.escape(args.version)}\s*$(.*?)(?=^## |\Z)",
+        rf"^## {re.escape(version)}\s*$(.*?)(?=^## |\Z)",
         changelog,
         re.M | re.S,
     )
@@ -105,7 +108,7 @@ def cmd_notes(args: argparse.Namespace) -> None:
         pathlib.Path("package.v3.json").read_text(encoding="utf-8")
     ).get(PLUGIN_ID, {})
     if not section:
-        section = f"- {meta.get('history', {}).get('v' + args.version, '变更见提交记录')}"
+        section = f"- {meta.get('history', {}).get('v' + version, '变更见提交记录')}"
 
     lines = [
         "MoviePilot 插件「MetaTube 番号刮削」发布包，适用于 MoviePilot V3（容器版，Python ≥ 3.12）。",
@@ -113,8 +116,8 @@ def cmd_notes(args: argparse.Namespace) -> None:
         "## 安装方式",
         "",
         "插件市场添加仓库 `https://github.com/zcs19960929/MoviePilot-Plugins`，"
-        f"在插件详情页选择版本 `v{args.version}`；对应标签 `{tag_for(args.version)}`，"
-        f"附件 `{asset_for(args.version)}`。",
+        f"在插件详情页选择版本 `v{version}`；对应标签 `{tag_for(version)}`，"
+        f"附件 `{asset_for(version)}`。",
         "",
         "## 更新内容",
         "",
@@ -122,8 +125,8 @@ def cmd_notes(args: argparse.Namespace) -> None:
         "",
         "## 发布包",
         "",
-        f"- 标签：`{tag_for(args.version)}`",
-        f"- 附件：`{asset_for(args.version)}`（插件目录源码，不含 `__pycache__` 与缓存）",
+        f"- 标签：`{tag_for(version)}`",
+        f"- 附件：`{asset_for(version)}`（插件目录源码，不含 `__pycache__` 与缓存）",
         "- 依赖见包内 `requirements.txt`（`p115client`、`python-concurrenttools`，Python ≥ 3.12）",
     ]
     text = "\n".join(lines) + "\n"

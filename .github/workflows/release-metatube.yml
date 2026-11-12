@@ -101,8 +101,10 @@ jobs:
 
       - name: 生成 Release 说明
         shell: bash
-        run: python3 scripts/release/release.py notes \
-          "${{ steps.meta.outputs.version }}" dist/release-notes.md
+        run: |
+          set -euo pipefail
+          python3 scripts/release/release.py notes \
+            "${{ steps.meta.outputs.version }}" dist/release-notes.md
 
       - name: 检查同版本 Release
         id: existing
