@@ -10,6 +10,8 @@ MetaTube 番号刮削插件（MoviePilot V3）
 import json
 import os
 import re
+import shutil
+import sqlite3
 import time
 import uuid
 import random
@@ -17,7 +19,7 @@ import tempfile
 import threading
 import xml.etree.ElementTree as ET
 from copy import copy
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from itertools import islice
 from pathlib import Path
@@ -84,12 +86,14 @@ def _pick_str(value, default: str = "") -> str:
     return str(value).strip() or default
 
 
-NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DV", "DVDR",
+NOISE_WORDS = {"SD", "HD", "DVD", "BD", "TV", "CD", "RIP", "WEB", "HDR", "DVDR",
     "MP4", "MKV", "AVI", "WMV", "MOV", "ISO", "EP", "PART", "VOL", "DISC",
     "SUB", "CHS", "CHT", "UHD", "SDR", "DDP", "DTS", "AAC", "FLAC", "HEVC",
     "AV1", "IMAX", "EXT", "FIN", "LEAK", "UNCUT", "CENSORED", "UNCENSORED",
     "NEW", "HQ", "GB", "MB", "TB", "ENG", "RAW", "CAM",
 }
+# 注意：DV 是 DEEP'S 的真实番号前缀（DV-1149 等），不能当作 DVDRip 画质词过滤。
+# 画质误判已由 (?![PIK]) 兜住：DV-1080P／DV-2160P 不会命中。
 
 # Storage names this plugin used to accept but no longer implements. Saved
 # configs keep the value; validation rejects it instead of silently degrading.
@@ -317,6 +321,31 @@ JS_RUN = """async () => {
   }
 }"""
 
+JS_CLEAN_RESET = """(value) => {
+  clean_reset = !!value;
+  clean_armed = false;
+  clean_msg = value ? '已启用完全重置：再次点击“清理缓存数据”确认清空全部登记。' : '';
+}"""
+
+# 完全重置是破坏性操作，要求连续两次点击确认；智能清理直接执行。
+JS_CLEAN = """async () => {
+  const reset = !!clean_reset;
+  if (reset && !clean_armed) {
+    clean_armed = true;
+    clean_msg = '完全重置会清空全部登记与播放标识，请再次点击“清理缓存数据”确认。';
+    return;
+  }
+  clean_armed = false;
+  clean_msg = reset ? '正在重置登记库…' : '正在清理缓存数据…';
+  try {
+    const r = await window.MoviePilotAPI.post('/plugin/MetaTubeScraper/cleanup?mode=' + (reset ? 'reset' : 'auto'), {});
+    const d = (r && r.data && r.data.code !== undefined) ? r.data : r;
+    clean_msg = (d && d.msg) ? d.msg : JSON.stringify(d);
+  } catch (e) {
+    clean_msg = '清理失败：' + ((e && e.message) ? e.message : e);
+  }
+}"""
+
 JS_ADD = """() => {
   if (dir_loading) { dir_error = '目录读取中，请稍候再添加'; return false; }
   const p = (browse_path || '').trim();
@@ -374,7 +403,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.4.2"
+    plugin_version = "1.4.4"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -1416,6 +1445,11 @@ class MetaTubeScraper(_PluginBase):
             "path": "/115/browse", "endpoint": self.__api_115_browse,
             "methods": ["GET"], "auth": "bear", "summary": "浏览 115 目录",
         }, {
+            "path": "/cleanup", "endpoint": self.__api_cleanup,
+            "methods": ["GET", "POST"], "auth": "bear",
+            "summary": "清理插件缓存数据",
+            "description": "默认清理失效的输出登记、未完成的迁移与改名日志、增量扫描进度；mode=reset 时完全重置登记库并保留备份",
+        }, {
             "path": "/redirect_url", "endpoint": self.__api_redirect,
             "methods": ["GET", "HEAD"], "allow_anonymous": True,
             "summary": "使用已登记播放标识获取 115 直链",
@@ -1449,6 +1483,119 @@ class MetaTubeScraper(_PluginBase):
             return {"code": 400, "msg": str(e), "data": []}
         except Exception:
             return {"code": 500, "msg": "115 目录读取失败", "data": []}
+
+    # ---------------- 缓存清理 ----------------
+
+    def __registry_dir(self) -> Path:
+        if not hasattr(self, "get_data_path"):
+            raise CloudError("宿主无法提供插件数据目录")
+        return Path(self.get_data_path()) / "115_direct"
+
+    def __close_library_services(self):
+        """Release registry handles before rewriting or removing the database."""
+        with self._direct_lock:
+            for attribute in ("_direct_service", "_playback_service"):
+                service = getattr(self, attribute, None)
+                if service is not None:
+                    try:
+                        service.close()
+                    except Exception:
+                        pass
+                    setattr(self, attribute, None)
+            for service in getattr(self, "_retired_services", []):
+                try:
+                    service.close()
+                except Exception:
+                    pass
+            self._retired_services = []
+
+    def __clean_registry(self) -> Dict[str, int]:
+        """Drop ownership rows for missing files and unfinished rename journals.
+
+        Valid registrations stay untouched, so existing STRM playback links and
+        already published files keep working without a full re-scrape.
+        """
+        database = self.__registry_dir() / "direct.sqlite3"
+        if not database.is_file():
+            raise CloudError("登记库不存在，无需清理")
+        self.__close_library_services()
+        stats = {"orphan": 0, "plan": 0, "naming": 0, "checkpoint": 0}
+        connection = sqlite3.connect(str(database), timeout=30)
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            missing = [(path,) for (path,) in connection.execute("SELECT path FROM outputs")
+                       if not Path(path).exists()]
+            if missing:
+                connection.executemany("DELETE FROM outputs WHERE path=?", missing)
+            stats["orphan"] = len(missing)
+            for account, root, number, raw in list(connection.execute(
+                    "SELECT account, root, number, plan FROM library_migrations")):
+                try:
+                    plan = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(plan, dict) or plan.get("stage") == "done":
+                    continue
+                stats["plan"] += 1
+                if plan.pop("naming", None) is not None:
+                    stats["naming"] += 1
+                connection.execute(
+                    "UPDATE library_migrations SET plan=? WHERE account=? AND root=? AND number=?",
+                    (json.dumps(plan, ensure_ascii=False), account, root, number))
+            try:
+                stats["checkpoint"] = connection.execute("DELETE FROM scan_checkpoint").rowcount
+            except sqlite3.OperationalError:
+                stats["checkpoint"] = 0
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        return stats
+
+    def __reset_registry(self) -> Dict[str, Any]:
+        """Drop the whole registry after keeping a restorable copy."""
+        directory = self.__registry_dir()
+        database = directory / "direct.sqlite3"
+        self.__close_library_services()
+        removed: List[str] = []
+        backup = Path(self.get_data_path()) / "maintenance-backups" / datetime.now().strftime("cleanup-%Y%m%dT%H%M%S")
+        if database.is_file():
+            backup.mkdir(parents=True, exist_ok=True)
+            for suffix in ("", "-wal", "-shm"):
+                source = Path(str(database) + suffix)
+                if source.is_file():
+                    shutil.copy2(source, backup / source.name)
+                    source.unlink()
+                    removed.append(source.name)
+        self.save_data("last_run", {})
+        return {"files": removed, "backup": str(backup)}
+
+    def __api_cleanup(self, mode: str = "auto") -> Dict[str, Any]:
+        if self._running:
+            return {"code": 400, "msg": "刮削任务正在运行，请等待结束或先停止任务再清理"}
+        reset = str(mode or "auto").strip().lower() == "reset"
+        try:
+            if reset:
+                result = self.__reset_registry()
+                if not result["files"]:
+                    return {"code": 0, "msg": "登记库不存在，已清除运行记录"}
+                message = ("登记库已重置，删除 " + "、".join(result["files"])
+                           + "；备份目录 " + result["backup"] + "。已有 STRM 需重新登记后才能生成。")
+                self.warn("插件缓存已完全重置：" + message)
+                return {"code": 0, "msg": message}
+            stats = self.__clean_registry()
+            message = (f"已清理：失效输出登记 {stats['orphan']} 条，未完成迁移计划 {stats['plan']} 个"
+                       f"（含卡住的改名日志 {stats['naming']} 份），增量扫描进度 {stats['checkpoint']} 条。"
+                       f"有效播放标识和媒体文件均未改动。")
+            self.info(message)
+            return {"code": 0, "msg": message}
+        except CloudError as e:
+            return {"code": 400, "msg": str(e)}
+        except Exception as e:
+            self.error(f"清理缓存失败：{e}")
+            return {"code": 500, "msg": "清理失败：" + type(e).__name__ + "，详情见插件日志"}
 
     def __api_redirect(self, request: Request, media_id: str = ""):
         from starlette.responses import JSONResponse, RedirectResponse
@@ -1807,6 +1954,14 @@ class MetaTubeScraper(_PluginBase):
                 text("run_msg", "执行结果", md=8, readonly=True, variant="plain")),
             row(button("测试数据源", JS_SELFTEST, icon="mdi-flask"),
                 text("test_number", "测试用番号", "SSIS-110", "修改配置后先保存再测试", md=8)),
+            alert("清理只作用于 115 直连登记库：删除指向已不存在文件的输出登记，清掉未完成的迁移和改名日志，并清空增量扫描进度。不删除媒体文件，也不改变有效播放标识。", direct),
+            row(button("清理缓存数据", JS_CLEAN, icon="mdi-broom", color="warning", md=3, show=direct),
+                col({"component": "VSwitch", "props": {
+                    "model": "clean_reset", "label": "完全重置登记库", "color": "error",
+                    "hint": "清空 direct.sqlite3 并备份到 maintenance-backups；已生成的 STRM 会因未登记而不再被接管",
+                    "persistent-hint": True, "onUpdate:modelValue": JS_CLEAN_RESET,
+                }}, md=4, show=direct),
+                text("clean_msg", "清理结果", md=5, show=f"{direct} && !!clean_msg", readonly=True, variant="plain")),
         ]}]
         data = {
             "enabled": False, "metatube_url": "", "metatube_token": "",
@@ -1820,6 +1975,7 @@ class MetaTubeScraper(_PluginBase):
             "dir_parent": "id:0", "browse_path": "/", "pick_dir": None, "dir_items": [], "dir_loading": False,
             "browse_display_path": "/", "dir_labels": {}, "dir_picker_open": False, "dir_ready": False, "dir_page": 1,
             "dir_error": "", "run_msg": "", "test_number": "SSIS-110", "scan_dirs": "",
+            "clean_msg": "", "clean_reset": False, "clean_armed": False,
             "write_local": True, "write_remote": False, "remote_lib_root": "", "local_strm_root": "",
             "organize": False, "scan_mode": "subdir", "scan_strategy": "full", "file_interval": 3,
             "movie_limit": 30, "cron_hour": 4, "cron_minute": 30, "force_overwrite": False,
