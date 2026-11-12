@@ -5,6 +5,7 @@
     "icon": "https://github.com/metatube-community.png",
     "author": "zhangchangsheng",
     "level": 1,
+    "release": true,
     "v3": true,
     "history": {
       "v1.4.5": "支持下载站排序号粘在字母番号前，`1KRMV-279` 可识别；`1CD-01`、`1DVD-02`、`1HD-720P` 等分段与画质标记仍被排除。",
