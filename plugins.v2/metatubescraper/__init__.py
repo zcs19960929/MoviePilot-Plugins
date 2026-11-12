@@ -403,7 +403,7 @@ class MetaTubeScraper(_PluginBase):
         "支持本地与网盘存储（u115 等），目录可视化选择，内置限速与单次上限以降低 115 风控风险。"
     )
     plugin_icon = "https://github.com/metatube-community.png"
-    plugin_version = "1.4.4"
+    plugin_version = "1.4.5"
     plugin_config_prefix = "metatubescraper_"
     plugin_order = 20
     auth_level = 1
@@ -704,6 +704,15 @@ class MetaTubeScraper(_PluginBase):
         m = re.search(r"(?<![A-Z0-9])(\d{2,3}[A-Z]{2,6})-(\d{2,5})(?!\d)", t)
         if m:
             return f"{m.group(1)}-{m.group(2)}"
+
+        # 下载站排序号粘在字母番号前：1KRMV-279、2SSIS-001。只接受单个前导数字，
+        # 且字母前缀仍要排除画质词，避免 1CD-01、1DVD-02 之类的分段标记误判。
+        m = re.search(r"(?<![A-Z0-9])(\d)([A-Z]{2,6})-(\d{2,5})(?!\d)(?![PIK])", t)
+        if m and m.group(2) not in NOISE_WORDS:
+            digits = m.group(3)
+            if len(digits) == 2:
+                digits = "0" + digits
+            return f"{m.group(1)}{m.group(2)}-{digits}"
 
         for m in re.finditer(r"(?<![A-Z0-9])([A-Z]{2,6})-?(\d{2,5})(?!\d)(?![PIK])", t):
             prefix = m.group(1)
