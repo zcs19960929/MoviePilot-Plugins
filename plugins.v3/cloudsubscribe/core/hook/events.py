@@ -360,25 +360,40 @@ class PluginEventHandler(OwnerDelegator):
             }
         label = str(event_data.get("link_label") or "").strip()
         result_title = f"【网盘订阅】{label + ' ' if label else ''}资源提交结果"
-        result_text = self._format_remote_link_result(result)
-        result_buttons = self._remote_link_result_buttons(result)
-        if not self._edit_progress_message(
-                event_data,
-                result_title,
-                result_text,
-                buttons=result_buttons,
-        ):
-            if not event_data.get("progress_message"):
-                self._post_command_message(
+        try:
+            result_text = self._format_remote_link_result(result)
+        except Exception as error:  # 格式化失败不能中断回复
+            logger.error(f"Telegram 结果格式化失败：{error}", exc_info=True)
+            result_text = "资源处理完成，但结果展示失败，请查看插件日志后重试"
+        try:
+            result_buttons = self._remote_link_result_buttons(result)
+        except Exception as error:
+            logger.debug(f"Telegram 结果按钮生成失败：{error}", exc_info=True)
+            result_buttons = None
+        try:
+            if not self._edit_progress_message(
                     event_data,
                     result_title,
                     result_text,
                     buttons=result_buttons,
-                )
+            ):
+                if not event_data.get("progress_message"):
+                    self._post_command_message(
+                        event_data,
+                        result_title,
+                        result_text,
+                        buttons=result_buttons,
+                    )
+        except Exception as error:
+            logger.error(f"Telegram 结果消息发送失败：{error}", exc_info=True)
+        safe_result = result if isinstance(result, dict) else {}
+        safe_data = safe_result.get("data")
+        if not isinstance(safe_data, dict):
+            safe_data = {}
         logger.info(
-            f"Telegram 资源提交完成：成功={bool(result.get('success'))}，"
-            f"需要选择={bool((result.get('data') or {}).get('selection_required'))}，"
-            f"结果={result.get('message') or '无'}"
+            f"Telegram 资源提交完成：成功={bool(safe_result.get('success'))}，"
+            f"需要选择={bool(safe_data.get('selection_required'))}，"
+            f"结果={safe_result.get('message') or '无'}"
         )
         return result
 
@@ -391,11 +406,17 @@ class PluginEventHandler(OwnerDelegator):
 
     @staticmethod
     def _format_remote_link_result(result: dict) -> str:
-        data = result.get("data") or {}
+        # 防御：提交链路异常时可能返回 None 或非字典结构，直接崩溃会让整个
+        # telegram 处理线程中断，表现为「机器人毫无反应」。
+        if not isinstance(result, dict):
+            result = {"success": False, "message": "资源处理异常，请重试或查看插件日志"}
+        data = result.get("data")
+        if not isinstance(data, dict):
+            data = {}
         if not data.get("selection_required"):
             lines = [str(result.get("message") or "资源提交失败")]
-            media = data.get("media") or {}
-            if media:
+            media = data.get("media")
+            if isinstance(media, dict) and media:
                 media_type = {
                     "movie": "电影",
                     "tv": "电视剧",
@@ -406,7 +427,10 @@ class PluginEventHandler(OwnerDelegator):
                     if str(value).isdigit() and int(value) > 0
                 ]
                 if not seasons and media.get("season"):
-                    seasons = [int(media.get("season"))]
+                    try:
+                        seasons = [int(media.get("season"))]
+                    except (TypeError, ValueError):
+                        seasons = []
                 season = (
                     " · " + "/".join(f"S{value:02d}" for value in sorted(set(seasons)))
                     if seasons else ""
@@ -417,7 +441,10 @@ class PluginEventHandler(OwnerDelegator):
                 )
             return "\n".join(lines)
         lines = [str(result.get("message") or "请选择 TMDB 媒体")]
-        for item in list(data.get("candidates") or [])[:10]:
+        candidates = data.get("candidates")
+        for item in list(candidates or [])[:10] if isinstance(candidates, list) else []:
+            if not isinstance(item, dict):
+                continue
             year = f" ({item.get('year')})" if item.get("year") else ""
             media_type = item.get("media_type_name") or item.get("media_type") or ""
             lines.append(
@@ -426,13 +453,20 @@ class PluginEventHandler(OwnerDelegator):
         return "\n".join(lines)
 
     def _remote_link_result_buttons(self, result: dict) -> Optional[list]:
-        data = result.get("data") or {}
+        if not isinstance(result, dict):
+            return None
+        data = result.get("data")
+        if not isinstance(data, dict):
+            return None
         selection_id = str(data.get("selection_id") or "")
         if not data.get("selection_required") or not selection_id:
             return None
         plugin_id = self._owner.__class__.__name__
+        candidates = data.get("candidates")
         buttons = []
-        for item in list(data.get("candidates") or [])[:10]:
+        for item in list(candidates or [])[:10] if isinstance(candidates, list) else []:
+            if not isinstance(item, dict):
+                continue
             media_type = str(item.get("media_type") or "").lower()
             media_code = (
                 "m" if media_type == "movie"
