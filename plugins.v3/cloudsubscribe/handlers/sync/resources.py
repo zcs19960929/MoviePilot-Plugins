@@ -1,0 +1,1147 @@
+"""候选资源解析、校验与网盘 Provider 路由。"""
+
+import copy
+import re
+from pathlib import PurePosixPath
+from typing import Any, Dict, List, Mapping, Optional, Set, Tuple
+from urllib.parse import unquote, urlsplit
+
+from app.log import logger
+
+from .utils import extract_ed2k_filename
+from ...core import (
+    CloudDriveCapability,
+    CloudDriveProvider,
+    CloudFile,
+    OwnerDelegator,
+)
+from ...drive.common import format_size
+from ...search.types import (
+    CANDIDATE_RESOURCE_TYPES,
+    normalize_resource_type,
+    resource_type_from_url,
+    resource_type_name,
+)
+from ...utils import MediaFileParser, parse_magnet_metadata
+from ...utils.share_expiry import is_share_expired
+
+
+class ResourceTransferService(OwnerDelegator):
+    """统一搜索候选到网盘转存能力之间的适配。"""
+
+    _TITLE_SEASON_PATTERN = re.compile(
+        r"(?<![A-Za-z0-9])[Ss]\s*0*(\d{1,3})(?!\d)|"
+        r"第\s*0*(\d{1,3})\s*季"
+    )
+
+    @staticmethod
+    def _is_cloud_resource_url(value: str) -> bool:
+        return str(value or "").strip().lower().startswith("cloud://")
+
+    def _resource_input_label(self, value: str) -> str:
+        if self._is_cloud_resource_url(value):
+            return "网盘路径"
+        if self._is_offline_url(value):
+            return "离线资源"
+        return "分享"
+
+    @classmethod
+    def _cloud_resource_provider_key(cls, value: str) -> str:
+        if not cls._is_cloud_resource_url(value):
+            return ""
+        return str(urlsplit(str(value).strip()).netloc or "").strip().lower()
+
+    def _is_direct_cloud_resource_url(self, value: str) -> bool:
+        source_key = self._cloud_resource_provider_key(value)
+        target_key = str(getattr(self._cloud_drive, "key", "") or "").strip().lower()
+        return not source_key or not target_key or source_key == target_key
+
+    @classmethod
+    def _cloud_resource_path(cls, value: str) -> str:
+        if not cls._is_cloud_resource_url(value):
+            return ""
+        path = unquote(urlsplit(str(value or "").strip()).path or "/")
+        return str(PurePosixPath("/" + path.replace("\\", "/").lstrip("/")))
+
+    def _resource_staging_dir(
+            self, share_url: str, file_item: Optional[Dict[str, Any]] = None
+    ) -> str:
+        if (
+                self._is_cloud_resource_url(share_url)
+                and self._is_direct_cloud_resource_url(share_url)
+        ):
+            source_path = str((file_item or {}).get("cloud_path") or "").strip()
+            return source_path or self._cloud_resource_path(share_url)
+        transfer_path = str(getattr(self, "_cloud_transfer_path", "/") or "/").rstrip("/") or "/"
+        organize_enabled = getattr(self, "_organize_after_transfer", True)
+        if not organize_enabled and file_item:
+            parent_path = str(file_item.get("parent_path") or "").strip("/").strip()
+            if not parent_path:
+                rel = str(
+                    file_item.get("_relative_path")
+                    or file_item.get("relative_path")
+                    or ""
+                ).strip("/").strip()
+                if rel and "/" in rel:
+                    parent_path = rel.rsplit("/", 1)[0]
+            if parent_path:
+                return f"{transfer_path}/{parent_path}" if transfer_path != "/" else f"/{parent_path}"
+        return transfer_path
+
+    def _list_cloud_resource_files(
+            self, path: str, provider_key: str = ""
+    ) -> List[Dict[str, Any]]:
+        """递归列出所选网盘目录，并保留每个文件的真实源目录。"""
+        source_drive = self._cloud_drive
+        if provider_key and self._cloud_drive_registry:
+            try:
+                source_drive = self._cloud_drive_registry.get(provider_key)
+            except KeyError:
+                return []
+        if not source_drive or not source_drive.supports(CloudDriveCapability.DIRECTORY_READ):
+            return []
+        directory_service = source_drive.require(CloudDriveCapability.DIRECTORY_READ)
+        lookup = directory_service.resolve_directory(path)
+        if not lookup.checked:
+            raise RuntimeError(f"读取网盘资源路径失败：{path}")
+        if lookup.directory_id is None:
+            return []
+        files = []
+        root_path = PurePosixPath(path)
+        stack = [(path, str(lookup.directory_id))]
+        visited = set()
+        while stack:
+            current_path, directory_id = stack.pop()
+            if directory_id in visited:
+                continue
+            visited.add(directory_id)
+            listing = directory_service.list_directory(directory_id)
+            if not listing.checked:
+                raise RuntimeError(f"读取网盘资源目录失败：{current_path}")
+            for item in listing.files:
+                if item.is_directory:
+                    child_path = str(PurePosixPath(current_path) / item.name)
+                    stack.append((child_path, str(item.id)))
+                    continue
+                current_posix_path = PurePosixPath(current_path)
+                try:
+                    relative_parent = current_posix_path.relative_to(root_path)
+                except ValueError:
+                    relative_parent = current_posix_path
+                relative_path = str(relative_parent / item.name).lstrip("/")
+                files.append({
+                    **dict(item),
+                    "cloud_path": current_path,
+                    "cloud_provider": provider_key,
+                    "_relative_path": relative_path,
+                    "_cloud_file": item,
+                })
+        return files
+
+    @staticmethod
+    def _resource_preview_episodes(
+            resource: Dict[str, Any], season: int
+    ) -> Set[int]:
+        """读取搜索阶段已取得的文件预览，不额外请求网盘接口。"""
+        preview_episodes = resource.get("preview_episodes") or {}
+        values = preview_episodes.get(
+            str(season), preview_episodes.get(season, [])
+        )
+        episodes = set()
+        for value in values or []:
+            try:
+                episodes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return episodes
+
+    @staticmethod
+    def _resource_title_episodes(title: str, season: int) -> Set[int]:
+        """从资源标题读取明确的单集信息，不为汇总标题猜测集数。"""
+        text = str(title or "").strip()
+        if not text:
+            return set()
+        episodes: Set[int] = set()
+        season_number = int(season or 1)
+        season_pattern = re.compile(
+            r"[Ss](\d{1,2})[Ee]\s*0*(\d{1,4})"
+            r"(?:\s*[-~～–—至到]\s*[Ee]?\s*0*(\d{1,4}))?"
+        )
+        for match in season_pattern.finditer(text):
+            if int(match.group(1)) != season_number:
+                continue
+            start = int(match.group(2))
+            end = int(match.group(3) or start)
+            if start <= end and end - start <= 999:
+                episodes.update(range(start, end + 1))
+
+        # 防止 S02E08-E09 的尾部 E09 被当成无季号表达式再次命中。
+        unscoped_text = season_pattern.sub(
+            lambda match: " " * len(match.group(0)), text
+        )
+        for pattern in (
+                re.compile(
+                    r"(?<!\d)第\s*0*(\d{1,4})"
+                    r"(?:\s*[-~～–—至到]\s*0*(\d{1,4}))?\s*集"
+                ),
+                re.compile(
+                    r"(?<![A-Za-z0-9])[Ee][Pp]?\s*0*(\d{1,4})"
+                    r"(?:\s*[-~～–—至到]\s*[EePp]?\s*0*(\d{1,4}))?(?!\d)"
+                ),
+                re.compile(
+                    r"\[(?:EP|E)?\s*0*(\d{1,3})\s*[-~～–—至到]\s*(?:EP|E)?\s*0*(\d{1,3})(?:v\d)?"
+                    r"(?:\s*(?:合集|全集|Fin|End|完|话|話|集|\+SP|\+OVA))?[^\]]*\]",
+                    re.IGNORECASE,
+                ),
+        ):
+            for match in pattern.finditer(unscoped_text):
+                start = int(match.group(1))
+                end = int(match.group(2) or start)
+                if end < start or end - start > 999:
+                    continue
+                episodes.update(range(start, end + 1))
+
+        # 全集解析如 [全12话], - 全12话, (全12集)
+        for match in re.finditer(r"(?:\[|[\s\-_(（])全\s*0*(\d{1,3})\s*[话話集](?:\]|[\s\-_)）]|$)", unscoped_text,
+                                 re.IGNORECASE):
+            total = int(match.group(1))
+            if 0 < total <= 200:
+                episodes.update(range(1, total + 1))
+        return {episode for episode in episodes if episode > 0}
+
+    @classmethod
+    def _resource_title_seasons(cls, title: str) -> Set[int]:
+        """提取标题中明确声明的季号。"""
+        seasons = set()
+        for match in cls._TITLE_SEASON_PATTERN.finditer(str(title or "")):
+            value = match.group(1) or match.group(2)
+            if value and int(value) > 0:
+                seasons.add(int(value))
+        return seasons
+
+    @staticmethod
+    def _magnet_resource_title(resource: Dict[str, Any]) -> str:
+        """合并所有来源可能携带的 Magnet 发布标题。"""
+        metadata = resource.get("magnet_metadata") or {}
+        values = (
+            resource.get("title"),
+            resource.get("description"),
+            resource.get("name"),
+            resource.get("raw_title"),
+            resource.get("rawTitle"),
+            resource.get("release_name"),
+            resource.get("magnet_name"),
+            resource.get("magnet_uri_name"),
+            resource.get("torrent_name"),
+            metadata.get("display_name"),
+        )
+        return " ".join(dict.fromkeys(
+            str(value or "").strip() for value in values if str(value or "").strip()
+        ))
+
+    @classmethod
+    def _prepare_magnet_resource(
+            cls, resource: Dict[str, Any], share_url: str
+    ) -> str:
+        """统一补全 Magnet URI 展示名和轻量集数预览，不请求远端 torrent 元数据。"""
+        metadata = dict(resource.get("magnet_metadata") or {})
+        provider_text = cls._magnet_resource_title(resource)
+        parsed = parse_magnet_metadata(share_url, provider_text=provider_text)
+        if parsed:
+            for key, value in parsed.items():
+                if value and not metadata.get(key):
+                    metadata[key] = value
+            if metadata:
+                resource["magnet_metadata"] = metadata
+            if parsed.get("display_name"):
+                resource["magnet_uri_name"] = parsed["display_name"]
+                if not resource.get("magnet_name"):
+                    resource["magnet_name"] = parsed["display_name"]
+            if parsed.get("preview_episodes") and not resource.get("preview_episodes"):
+                resource["preview_episodes"] = parsed["preview_episodes"]
+        return cls._magnet_resource_title(resource)
+
+    @classmethod
+    def _magnet_title_episodes(
+            cls, resource: Dict[str, Any], season: int
+    ) -> Set[int]:
+        """从统一标题和来源结构化集数字段提取明确集数。"""
+        episodes = cls._resource_title_episodes(
+            cls._magnet_resource_title(resource), season
+        )
+        season_value = resource.get("season")
+        try:
+            season_matches = season_value in (None, "") or int(season_value) == int(season)
+        except (TypeError, ValueError):
+            season_matches = False
+        if season_matches:
+            episode_values = resource.get("episodes")
+            if not isinstance(episode_values, (list, tuple, set)):
+                episode_values = [episode_values or resource.get("episode")]
+            for value in episode_values:
+                try:
+                    episode = int(value)
+                except (TypeError, ValueError):
+                    episodes.update(
+                        cls._resource_title_episodes(f"E{value}", season)
+                    )
+                else:
+                    if episode > 0:
+                        episodes.add(episode)
+            try:
+                start = int(resource.get("episode_start") or 0)
+                end = int(resource.get("episode_end") or start)
+            except (TypeError, ValueError):
+                start = end = 0
+            if 0 < start <= end and end - start <= 999:
+                episodes.update(range(start, end + 1))
+        return episodes
+
+    @classmethod
+    def _magnet_title_seasons(cls, resource: Dict[str, Any]) -> Set[int]:
+        """从统一标题和来源结构化字段提取明确季号。"""
+        seasons = cls._resource_title_seasons(
+            cls._magnet_resource_title(resource)
+        )
+        try:
+            structured = int(resource.get("season") or 0)
+        except (TypeError, ValueError):
+            structured = 0
+        if structured > 0:
+            seasons.add(structured)
+        return seasons
+
+    def _offline_link_size(self, url: str) -> int:
+        """离线链接自带的精确单文件大小；Magnet 无单文件大小信息时返回 0。"""
+        if not self._is_ed2k_url(url):
+            return 0
+        parser = getattr(self._offline_download, "parse_ed2k_link", None)
+        if not parser:
+            return 0
+        try:
+            parsed = parser(str(url).strip()) or {}
+        except Exception:
+            return 0
+        try:
+            return max(0, int(parsed.get("size") or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def _magnet_history_entries(
+            self,
+            resource: Dict[str, Any],
+            season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+    ) -> List[Dict[str, Any]]:
+        """从已校验 torrent 元数据生成历史占位文件，禁止使用发布标题猜测。"""
+        metadata = resource.get("magnet_metadata") or {}
+        target_set = {
+            int(value) for value in (target_episodes or []) if int(value) > 0
+        }
+        entries = []
+        seen = set()
+        for source in metadata.get("torrent_file_entries") or []:
+            path = str(source.get("path") or "").replace("\\", "/").strip("/")
+            file_name = path.rsplit("/", 1)[-1]
+            if not MediaFileParser.is_video(file_name):
+                continue
+            try:
+                entry_season = int(source.get("season") or 0)
+                episode = int(source.get("episode") or 0)
+            except (TypeError, ValueError):
+                continue
+            if season is None and not entry_season and not episode:
+                entries.append({
+                    "file_name": file_name,
+                    "file_size": max(0, int(source.get("size") or 0)),
+                    "season": 0,
+                    "episode": 0,
+                })
+                continue
+            if season is not None and entry_season != int(season):
+                continue
+            if target_set and episode not in target_set:
+                continue
+            identity = (entry_season, episode, file_name.casefold())
+            if identity in seen:
+                continue
+            seen.add(identity)
+            entries.append({
+                "file_name": file_name,
+                "file_size": max(0, int(source.get("size") or 0)),
+                "season": entry_season,
+                "episode": episode,
+            })
+        if not entries:
+            file_list = resource.get("file_list") or []
+            file_name = ""
+            if isinstance(file_list, list) and file_list:
+                file_name = str(file_list[0]).strip()
+            if not file_name:
+                file_name = str(
+                    (resource.get("magnet_metadata") or {}).get("display_name") or resource.get("title") or "").strip()
+            if file_name and (MediaFileParser.is_video(file_name) or season is None):
+                eps = [int(v) for v in (target_episodes or []) if int(v) > 0]
+                ep = eps[0] if len(eps) == 1 else 0
+                entries.append({
+                    "file_name": file_name,
+                    "file_size": (
+                            self._offline_link_size(str(resource.get("url") or ""))
+                            or max(0, int(resource.get("size") or 0))
+                    ),
+                    "season": int(season or 0),
+                    "episode": ep,
+                })
+        return entries
+
+    def _append_magnet_pending_history(
+            self,
+            history: List[Dict[str, Any]],
+            mediainfo: Any,
+            subscribe: Any,
+            share_url: str,
+            cloud_dir: str,
+            resource: Dict[str, Any],
+            finalize_key: str,
+            season: Optional[int] = None,
+            target_episodes: Optional[List[int]] = None,
+            **fields: Any,
+    ) -> int:
+        """按 torrent 真实媒体文件追加待完成历史，并避免同任务重复记录。"""
+        entries = self._magnet_history_entries(resource, season, target_episodes)
+        if not entries:
+            return 0
+        existing = {
+            (
+                str(item.get("finalize_key") or ""),
+                int(item.get("season") or 0),
+                int(item.get("episode") or 0),
+            )
+            for item in history
+            if isinstance(item, dict)
+        }
+        appended = 0
+        for entry in entries:
+            identity = (
+                finalize_key,
+                int(entry.get("season") or 0),
+                int(entry.get("episode") or 0),
+            )
+            if identity in existing:
+                continue
+            record_fields = dict(fields)
+            record_fields.update({
+                "file_size": entry["file_size"],
+                "season": entry["season"],
+                "episode": entry["episode"],
+                "target_episodes": [entry["episode"]],
+                "finalize_key": finalize_key,
+            })
+            history.append(self._build_transfer_history_item(
+                mediainfo=mediainfo,
+                subscribe=subscribe,
+                status="下载中",
+                share_url=share_url,
+                file_name=entry["file_name"],
+                source_file_name=entry["file_name"],
+                cloud_dir=cloud_dir,
+                resource=resource,
+                **record_fields,
+            ))
+            existing.add(identity)
+            appended += 1
+        return appended
+
+    def _resource_history_meta(
+            self, resource: Dict[str, Any], share_url: str
+    ) -> Dict[str, Any]:
+        source = str(resource.get("source") or "unknown").strip().lower()
+        resource_type = normalize_resource_type(
+            resource.get("resource_type") or resource.get("pan_type") or ""
+        )
+        if not resource_type:
+            resource_type = resource_type_from_url(share_url) or "unknown"
+        points = resource.get("unlock_points")
+        try:
+            points = int(points) if points is not None else None
+        except (TypeError, ValueError):
+            points = None
+        source_url = ""
+        if source != "manual":
+            for value in (
+                    resource.get("source_url"), resource.get("media_page_url")
+            ):
+                candidate = str(value or "").strip()
+                if candidate.lower().startswith(("http://", "https://")):
+                    if source == "hdhive":
+                        parsed = urlsplit(candidate)
+                        candidate = f"{parsed.path or '/'}{f'?{parsed.query}' if parsed.query else ''}"
+                    source_url = candidate
+                    break
+        result = {
+            "resource_type": resource_type,
+            "source": source,
+            "points": points,
+        }
+        if resource.get("skip_history"):
+            result["skip_history"] = True
+        if source_url:
+            result["source_url"] = source_url
+        return result
+
+    @staticmethod
+    def _extract_url_filename(url: str) -> str:
+        if not url:
+            return ""
+        ed2k_name = extract_ed2k_filename(url)
+        if ed2k_name:
+            return ed2k_name
+        text = str(url).strip()
+        if text.lower().startswith("magnet:"):
+            match = re.search(r"[?&]dn=([^&]+)", text)
+            if match:
+                return unquote(match.group(1)).strip()
+        return ""
+
+    def _expand_resource_urls(
+            self,
+            resources: List[Dict[str, Any]],
+            resource_index: int,
+            resource: Dict[str, Any],
+            value: Any,
+    ) -> str:
+        """展开列表或字符串中的多条离线链接，后续条目不重复计算积分。"""
+        raw_values = value if isinstance(value, (list, tuple)) else [value]
+        urls = []
+        seen_urls = set()
+        for raw_value in raw_values:
+            text = str(raw_value or "").replace("｜", "|").strip()
+            if not text:
+                continue
+            matches = list(self._OFFLINE_RESOURCE_URL_RE.finditer(text))
+            extracted = [match.group(0).strip() for match in matches]
+            remainder = self._OFFLINE_RESOURCE_URL_RE.sub("", text).strip()
+            candidates = extracted if extracted and not remainder else [text]
+            for url in candidates:
+                if url in seen_urls:
+                    continue
+                seen_urls.add(url)
+                urls.append(url)
+        if not urls:
+            return ""
+
+        resource["url"] = urls[0]
+        resource["need_unlock"] = False
+        resource["need_access"] = False
+        first_size = self._offline_link_size(urls[0])
+        if first_size:
+            resource["size"] = first_size
+            resource["size_human"] = format_size(first_size)
+        file_list = [str(f).strip() for f in (resource.get("file_list") or []) if str(f or "").strip()]
+        first_name = (
+            file_list[0]
+            if file_list and len(file_list) > 0
+            else self._extract_url_filename(urls[0])
+        )
+        if first_name:
+            resource["title"] = first_name
+            resource["file_name"] = first_name
+            resource["description"] = first_name
+            resource["file_list"] = [first_name]
+        if len(urls) > 1:
+            expanded = []
+            for i, url in enumerate(urls[1:], 1):
+                item = copy.deepcopy(resource)
+                item["url"] = url
+                item["unlock_points"] = 0
+                item_size = self._offline_link_size(url)
+                if item_size:
+                    item["size"] = item_size
+                    item["size_human"] = format_size(item_size)
+                name = (
+                    file_list[i]
+                    if file_list and i < len(file_list)
+                    else self._extract_url_filename(url)
+                )
+                if name:
+                    item["title"] = name
+                    item["file_name"] = name
+                    item["description"] = name
+                    item["file_list"] = [name]
+                expanded.append(item)
+            resources[resource_index + 1:resource_index + 1] = expanded
+            source_name = str(resource.get("source") or "资源源").upper()
+            logger.debug(
+                f"{source_name} 同一资源包含 {len(urls)} 条链接，"
+                "已展开处理且积分仅计一次"
+            )
+        return urls[0]
+
+    def _resolve_candidate_resource_url(
+            self,
+            resources: List[Dict[str, Any]],
+            resource_index: int,
+            resource: Dict[str, Any],
+            search_label: str,
+            log_prefix: str = "",
+    ) -> str:
+        """统一处理积分搜索源的延迟解锁，并展开一次返回的多条链接。"""
+        resource_ref = str(resource.get("resource_ref") or "").strip()
+        if resource_ref and self._is_resource_ref_blacklisted(resource_ref):
+            prefix = f"{log_prefix} " if log_prefix else ""
+            logger.debug(f"{prefix}跳过已加入黑名单的资源：{resource_ref}")
+            return ""
+        share_url = str(resource.get("url") or "").strip()
+        if share_url:
+            if self._drop_expired_resource_link(share_url, resource_ref, log_prefix):
+                return ""
+            return self._expand_resource_urls(
+                resources, resource_index, resource, share_url
+            )
+        if not (
+                resource.get("need_unlock") or resource.get("need_access")
+        ):
+            return ""
+        if not resource_ref:
+            return ""
+        source = str(resource.get("source") or "").strip().lower()
+        try:
+            target_season = max(1, int(resource.get("target_season") or 1))
+        except (TypeError, ValueError):
+            target_season = 1
+        target_episodes = set()
+        for value in resource.get("target_episodes") or []:
+            try:
+                episode = int(value)
+            except (TypeError, ValueError):
+                continue
+            if episode > 0:
+                target_episodes.add(episode)
+        remark_episodes = self._resource_preview_episodes(
+            resource, target_season
+        )
+        if (
+                resource.get("preview_episodes_authoritative")
+                and target_episodes
+                and remark_episodes
+                and not (target_episodes & remark_episodes)
+        ):
+            prefix = f"{log_prefix} " if log_prefix else ""
+            logger.debug(
+                f"{prefix}{source.upper()} 预览已明确不覆盖当前缺集，"
+                f"跳过详情预览与解锁：resource_ref={resource_ref}"
+            )
+            return ""
+        try:
+            unlock_points = int(resource.get("unlock_points") or 0)
+        except (TypeError, ValueError):
+            unlock_points = 0
+        prefix = f"{log_prefix} " if log_prefix else ""
+        resource_title = str(resource.get("title") or "").strip()
+        if not self._search_handler.can_unlock(source):
+            logger.debug(
+                f"{prefix}跳过 {source.upper()} 资源 {resource_title}："
+                "渠道未声明资源解锁或按需解析能力"
+            )
+            return ""
+        has_budget = self._search_handler.has_unlock_budget(
+            source, unlock_points
+        )
+        source_label = self._search_handler.source_name(source)
+        if not has_budget:
+            logger.debug(
+                f"{prefix}跳过 {source_label} 资源 {resource_title}："
+                f"需要 {unlock_points} 积分，当前预算不足"
+            )
+            return ""
+        action_label = "获取免费资源链接" if unlock_points <= 0 else "消耗积分解锁"
+        media_page_url = str(resource.get("media_page_url") or "").strip()
+        media_page_suffix = f"，媒体页：{media_page_url}" if media_page_url else ""
+        logger.info(
+            f"{prefix}遇到尚未取得链接的 {source_label} 资源 {resource_title} "
+            f"(resource_ref: {resource_ref})，尝试{action_label}{media_page_suffix}"
+        )
+        unlocked = self._search_handler.unlock_resource(
+            source, resource, search_label=search_label
+        )
+        if self._stop_requested() or not unlocked:
+            if not self._stop_requested():
+                logger.error(
+                    f"{prefix}未能取得 {source_label} 资源链接：{resource_title}"
+                )
+            return ""
+        resolved_url = self._expand_resource_urls(
+            resources, resource_index, resource, unlocked
+        )
+        if self._drop_expired_resource_link(resolved_url, resource_ref, log_prefix):
+            return ""
+        return resolved_url
+
+    def _drop_expired_resource_link(
+            self,
+            share_url: str,
+            resource_ref: str,
+            log_prefix: str = "",
+    ) -> bool:
+        """分享已确认过期时拉黑 resource_ref 并跳过，避免每轮重复解锁转存。"""
+        if not self._is_expired_share_link(share_url):
+            return False
+        if resource_ref:
+            self._add_resource_ref_blacklist(resource_ref, "分享链接已过期")
+        prefix = f"{log_prefix} " if log_prefix else ""
+        logger.info(
+            f"{prefix}分享链接已确认过期，已加入黑名单跳过："
+            f"{self._resource_log_reference(share_url)}"
+        )
+        return True
+
+    def _validate_resource_url(
+            self,
+            share_url: str,
+            resource_label: str = "分享链接",
+            log_prefix: str = "",
+            strict: bool = False,
+    ) -> bool:
+        """使用对应 Provider 的统一能力校验资源链接。"""
+        prefix = f"{log_prefix} " if log_prefix else ""
+        if is_share_expired(share_url):
+            message = (
+                f"{prefix}{resource_label}已确认失效（24小时内跳过）："
+                f"{self._resource_log_reference(share_url)}"
+            )
+            (logger.warning if strict else logger.debug)(message)
+            return False
+        provider = self._resource_provider_for_url(share_url)
+        share_service = (
+            provider.require(CloudDriveCapability.SHARE_TRANSFER)
+            if provider else self._share_transfer
+        )
+        if not share_service:
+            return False
+        status = self._timed_sync_call(
+            "share_validation", share_service.check_share_status, share_url
+        )
+        if status.is_valid:
+            return True
+        prefix = f"{log_prefix} " if log_prefix else ""
+        message = (
+            f"{prefix}{resource_label}无效："
+            f"{self._resource_log_reference(share_url)}，原因：{status.status_text}"
+        )
+        (logger.warning if strict else logger.debug)(message)
+        return False
+
+    @staticmethod
+    def _explicit_selection_values(
+            resource: Optional[Dict[str, Any]],
+    ) -> Tuple[List[str], List[str]]:
+        """读取资源上用户显式勾选的文件标识（预览面板单个/批量转存）。"""
+        if not isinstance(resource, dict):
+            return [], []
+        raw_ids = resource.get("target_file_ids")
+        raw_names = resource.get("target_file_names")
+        ids = [
+            str(value).strip()
+            for value in (raw_ids if isinstance(raw_ids, (list, tuple, set)) else [])
+            if str(value or "").strip()
+        ]
+        names = [
+            str(value).strip()
+            for value in (raw_names if isinstance(raw_names, (list, tuple, set)) else [])
+            if str(value or "").strip()
+        ]
+        return ids, names
+
+    @staticmethod
+    def _filter_files_by_explicit_selection(
+            files: List[Dict[str, Any]],
+            target_file_ids: Optional[List[str]] = None,
+            target_file_names: Optional[List[str]] = None,
+            log_prefix: str = "",
+    ) -> List[Dict[str, Any]]:
+        """把分享文件收敛到用户显式选中的条目，未命中时回退原始列表。"""
+        selected_ids = {
+            str(value).strip()
+            for value in (target_file_ids or [])
+            if str(value or "").strip()
+        }
+        selected_names = {
+            str(value).strip().casefold()
+            for value in (target_file_names or [])
+            if str(value or "").strip()
+        }
+        if not selected_ids and not selected_names:
+            return files
+        selected: List[Dict[str, Any]] = []
+        for item in files:
+            file_id = str(
+                item.get("id") or item.get("file_id") or item.get("fid") or ""
+            ).strip()
+            if file_id and file_id in selected_ids:
+                selected.append(item)
+                continue
+            relative = str(
+                item.get("relative_path") or item.get("parent_path") or ""
+            ).strip()
+            name = str(item.get("name") or "").strip()
+            segments = {
+                segment.strip().casefold()
+                for segment in f"{relative}/{name}".split("/")
+                if segment.strip()
+            }
+            if name.casefold() in selected_names or segments & selected_names:
+                selected.append(item)
+        if not selected:
+            return files
+        return selected
+
+    def _validated_resource_files(
+            self,
+            share_url: str,
+            resource_title: str = "",
+            target_season: Optional[Any] = None,
+            log_prefix: str = "",
+            target_file_ids: Optional[List[str]] = None,
+            target_file_names: Optional[List[str]] = None,
+            strict: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """校验分享并读取文件列表，供电影、剧集和洗版共同使用。
+
+        ``strict`` 用于用户手动提交的资源：失败原因升到 WARNING，避免整条同步
+        只留下「共转存 0 个文件」而看不到任何原因。
+        """
+        if self._is_cloud_resource_url(share_url):
+            files = self._list_cloud_resource_files(
+                self._cloud_resource_path(share_url),
+                self._cloud_resource_provider_key(share_url),
+            )
+            files = list(MediaFileParser.iter_files(files))
+            if not files:
+                logger.debug(f"所选网盘路径没有可处理文件：{self._cloud_resource_path(share_url)}")
+            return files
+
+        cache_season_key = (
+            tuple(sorted(int(s) for s in target_season if str(s).isdigit()))
+            if isinstance(target_season, (set, list, tuple))
+            else target_season
+        )
+        file_cache_key = (
+            str(share_url).strip(),
+            cache_season_key,
+            tuple(sorted(target_file_ids or ())),
+            tuple(sorted(target_file_names or ())),
+        )
+        if not hasattr(self, "_validated_files_cache"):
+            self._validated_files_cache = {}
+        cached = self._validated_files_cache.get(file_cache_key)
+        if cached is not None:
+            logger.debug(
+                f"{log_prefix + ' ' if log_prefix else ''}复用已解析的分享文件列表："
+                f"{self._resource_log_reference(share_url)}（共 {len(cached)} 个文件）"
+            )
+            return copy.deepcopy(cached)
+
+        if not self._validate_resource_url(
+                share_url, resource_label="分享链接", log_prefix=log_prefix,
+                strict=strict,
+        ):
+            return []
+        kwargs = {}
+        if target_season is not None:
+            kwargs["target_season"] = target_season
+        if log_prefix:
+            kwargs["log_prefix"] = log_prefix
+        provider = self._resource_provider_for_url(share_url)
+        share_service = (
+            provider.require(CloudDriveCapability.SHARE_TRANSFER)
+            if provider else self._share_transfer
+        )
+        if not share_service:
+            return []
+        files = self._timed_sync_call(
+            "share_listing",
+            share_service.list_share_files,
+            share_url,
+            **kwargs,
+        ) or []
+        files = list(MediaFileParser.iter_files(files))
+        if not files:
+            label = resource_title or self._resource_log_reference(share_url)
+            message = f"{log_prefix + ' ' if log_prefix else ''}分享链接无内容：{label}"
+            (logger.warning if strict else logger.debug)(message)
+        files = self._filter_files_by_explicit_selection(
+            files,
+            target_file_ids=target_file_ids,
+            target_file_names=target_file_names,
+            log_prefix=log_prefix,
+        )
+        if files:
+            self._validated_files_cache[file_cache_key] = copy.deepcopy(files)
+        return files
+
+    def preview_resource_files(self, share_url: str) -> List[Dict[str, Any]]:
+        """只读校验分享链接并列举媒体文件，供无订阅入口识别内容。"""
+        return self._validated_resource_files(
+            share_url,
+            resource_title="Telegram 分享链接",
+            log_prefix="快速识别",
+        )
+
+    def _transfer_history_status(self, success: bool, share_url: str) -> str:
+        if not success:
+            return "失败"
+        return "下载中" if self._is_offline_url(share_url) else "成功"
+
+    @staticmethod
+    def _supported_resource_type(
+            resource: Dict[str, Any], share_url: str
+    ) -> str:
+        """识别候选资源类型：先取显式声明，再按域名匹配（规则见 search.types）。"""
+        resource_type = normalize_resource_type(
+            resource.get("resource_type") or resource.get("pan_type") or ""
+        )
+        if resource_type:
+            return resource_type
+        normalized_url = str(share_url).strip().lower()
+        if normalized_url.startswith("cloud://"):
+            return "cloud"
+        if normalized_url.startswith("ed2k://"):
+            return "ed2k"
+        if normalized_url.startswith("magnet:?"):
+            return "magnet"
+        # 历史行为：无法识别来源的候选按 115 分享处理。
+        return resource_type_from_url(normalized_url) or "115"
+
+    def _is_cross_drive_resource(
+            self, resource: Dict[str, Any], share_url: str = ""
+    ) -> bool:
+        """判断候选是否必须经过跨盘下载上传。"""
+        if not self._cloud_drive:
+            return False
+        actual_url = str(share_url or resource.get("url") or "").strip()
+        if self._supported_resource_type(resource, share_url) == "cloud":
+            return not self._is_direct_cloud_resource_url(actual_url)
+        if actual_url and not self._is_offline_url(actual_url):
+            source = self._resource_provider_for_url(actual_url)
+            if source:
+                return source.key != self._cloud_drive.key
+        resource_type = self._supported_resource_type(resource, actual_url)
+        return not self._cloud_drive.supports_resource_type(
+            normalize_resource_type(resource_type)
+        )
+
+    def _normalize_candidate_resource_type(self, resource: Dict[str, Any]) -> str:
+        """获取并规范化候选资源的类型键（与 resource_type_order 配置保持一致）。"""
+        rtype = normalize_resource_type(
+            resource.get("resource_type") or resource.get("pan_type") or ""
+        )
+        if rtype in CANDIDATE_RESOURCE_TYPES:
+            return rtype
+        url = str(resource.get("url") or "").strip()
+        if url:
+            if self._is_ed2k_url(url):
+                return "ed2k"
+            if self._is_magnet_url(url):
+                return "magnet"
+            if self._is_offline_url(url):
+                return "ed2k"
+            detected = self._supported_resource_type(resource, url)
+            if detected:
+                return detected.lower()
+        return rtype or "unknown"
+
+    def _build_transfer_resource_batches(
+            self,
+            sources: List[str],
+            source_results: Mapping[str, List[Dict[str, Any]]],
+    ) -> List[Tuple[str, List[Dict[str, Any]], bool]]:
+        """严格按用户配置的资源类型优先级（resource_type_order）组织并发搜索候选批次。
+
+        先按资源类型优先级全局排序，同类型按搜索源优先级组织；跨盘转存批次置于最后。
+        """
+        # 读取用户配置的资源类型优先级
+        configured_types = list(
+            getattr(self._search_handler, "_resource_type_order_config", None) or []
+        )
+        if not configured_types and self._cloud_drive:
+            configured_types = [self._cloud_drive.key.lower(), "ed2k", "magnet"]
+
+        # 将所有并发搜索结果汇总并按直存类型和跨盘归类
+        direct_by_type: Dict[str, Dict[str, List[Dict[str, Any]]]] = {}
+        cross_by_source: Dict[str, List[Dict[str, Any]]] = {}
+        total_direct_count = 0
+        total_cross_count = 0
+
+        for source in sources or []:
+            for resource in source_results.get(source) or []:
+                if self._is_cross_drive_resource(resource):
+                    cross_by_source.setdefault(source, []).append(resource)
+                    total_cross_count += 1
+                else:
+                    rtype = self._normalize_candidate_resource_type(resource)
+                    direct_by_type.setdefault(rtype, {}).setdefault(source, []).append(resource)
+                    total_direct_count += 1
+
+        # 严格按用户配置的资源类型优先级产出直存批次
+        ordered_batches: List[Tuple[str, List[Dict[str, Any]], bool]] = []
+        ordered_type_keys = [t for t in configured_types if t in direct_by_type]
+        remaining_type_keys = [t for t in direct_by_type if t not in configured_types]
+
+        for rtype in ordered_type_keys + remaining_type_keys:
+            sources_map = direct_by_type[rtype]
+            for source in sources or []:
+                items = sources_map.get(source)
+                if items:
+                    ordered_batches.append((source, items, False))
+
+        # 跨盘转存批次置于直存之后，按搜索源优先级排列
+        for source in sources or []:
+            items = cross_by_source.get(source)
+            if items:
+                ordered_batches.append((source, items, True))
+
+        if total_direct_count or total_cross_count:
+            type_summary = " > ".join(ordered_type_keys + remaining_type_keys)
+            logger.debug(
+                f"并发搜索候选：分享 {total_direct_count} 个（{type_summary}），"
+                f"跨盘 {total_cross_count} 个（最后处理）"
+            )
+        return ordered_batches
+
+    def _resource_provider_for_url(
+            self, share_url: str
+    ) -> Optional[CloudDriveProvider]:
+        if not self._cloud_drive_registry:
+            return self._cloud_drive
+        key = self._supported_resource_type({}, share_url)
+        if key == "cloud":
+            source_key = self._cloud_resource_provider_key(share_url)
+            if source_key and self._cloud_drive_registry:
+                try:
+                    return self._cloud_drive_registry.get(source_key)
+                except KeyError:
+                    return None
+            return self._cloud_drive
+        try:
+            return self._cloud_drive_registry.get(normalize_resource_type(key))
+        except KeyError:
+            return self._cloud_drive if key == "115" else None
+
+    @staticmethod
+    def _normalize_cross_transfer_media_type(value: Any) -> str:
+        normalized = str(getattr(value, "name", value) or "").strip().lower()
+        return {
+            "电影": "movie",
+            "电视剧": "tv",
+            "mediatype.movie": "movie",
+            "mediatype.tv": "tv",
+        }.get(normalized, normalized)
+
+    @staticmethod
+    def _cloud_file_from_dict(item: Dict[str, Any]) -> CloudFile:
+        existing = item.get("_cloud_file")
+        if isinstance(existing, CloudFile):
+            return existing
+        return CloudFile(
+            id=str(item.get("id") or ""),
+            name=str(item.get("name") or ""),
+            is_directory=False,
+            size=int(item.get("size") or 0),
+            sha1=str(item.get("sha1") or ""),
+            md5=str(item.get("md5") or ""),
+            native=item,
+        )
+
+    def _is_supported_resource(
+            self, resource: Dict[str, Any], share_url: str
+    ) -> bool:
+        if not self._cloud_drive:
+            return False
+        resource_type = self._supported_resource_type(resource, share_url)
+        if resource_type == "cloud":
+            source = self._resource_provider_for_url(share_url)
+            if not source or not source.supports(CloudDriveCapability.DIRECTORY_READ):
+                return False
+            if self._is_direct_cloud_resource_url(share_url):
+                return all(
+                    self._cloud_drive.supports(capability)
+                    for capability in (
+                        CloudDriveCapability.FILE_QUERY,
+                        CloudDriveCapability.FILE_MUTATION,
+                    )
+                )
+            return bool(
+                self._cross_transfer_enabled
+                and source.supports(CloudDriveCapability.FILE_QUERY)
+                and source.supports(CloudDriveCapability.FILE_DOWNLOAD)
+                and self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD)
+                and self._cloud_drive.supports(CloudDriveCapability.FILE_QUERY)
+            )
+        is_manual_override = bool(
+            resource.get("source") == "manual"
+            or resource.get("is_cross")
+            or resource.get("_manual")
+        )
+        if not self._cloud_drive.supports_resource_type(resource_type):
+            if not self._cross_transfer_enabled and not is_manual_override:
+                return False
+            source = self._resource_provider_for_url(share_url)
+            if not source or not source.supports(
+                    CloudDriveCapability.SHARE_TRANSFER
+            ):
+                return False
+            if not source.supports(CloudDriveCapability.FILE_QUERY):
+                return False
+            if not source.supports(CloudDriveCapability.FILE_DOWNLOAD):
+                return False
+            if not self._cloud_drive.supports(CloudDriveCapability.LOCAL_UPLOAD):
+                return False
+            if not self._cloud_drive.supports(CloudDriveCapability.FILE_QUERY):
+                return False
+        if resource_type in {"ed2k", "magnet"}:
+            return self._offline_download is not None
+        source = self._resource_provider_for_url(share_url)
+        return bool(
+            source and source.supports(CloudDriveCapability.SHARE_TRANSFER)
+        )
+
+    @classmethod
+    def _format_resource_summary(
+            cls, resources: List[Dict[str, Any]]
+    ) -> str:
+        summary_counts: Dict[str, Dict[str, int]] = {}
+        seen = set()
+        for resource in resources or []:
+            resource_type = cls._supported_resource_type(
+                resource, str(resource.get("url") or "")
+            )
+            label = resource_type_name(resource_type, resource_type.upper() or "未知")
+            identity = str(
+                resource.get("unlock_group") or resource.get("source_url")
+                or resource.get("url") or resource.get("title") or ""
+            )
+            key = (resource_type, identity)
+            if key in seen:
+                continue
+            seen.add(key)
+            counts = summary_counts.setdefault(
+                label, {"total": 0, "available": 0, "paid": 0, "official": 0}
+            )
+            counts["total"] += 1
+            if resource.get("is_official"):
+                counts["official"] += 1
+            if resource.get("need_unlock"):
+                counts["paid"] += 1
+            else:
+                counts["available"] += 1
+        summaries = []
+        for label, counts in summary_counts.items():
+            statuses = [f"可用 {counts['available']}"]
+            if counts["paid"]:
+                statuses.append(f"待解锁 {counts['paid']}")
+            if counts["official"]:
+                statuses.append(f"官组 {counts['official']}")
+            summaries.append(
+                f"{label} {counts['total']}（{'，'.join(statuses)}）"
+            )
+        return f"共 {len(seen)} 个候选资源：" + "；".join(summaries)

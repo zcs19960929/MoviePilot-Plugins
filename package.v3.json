@@ -30,5 +30,20 @@
       "v1.1.0": "新增 115 Cookie 独立访问、视频字幕关联改名、本地 STRM/字幕/NFO/图片生成、SQLite 续跑及稳定 302 播放入口；直连模式要求 Python 3.12+。",
       "v1.0.1": "修复数据源自检漏传 Token 导致全部 401，保留 HTTP 状态和错误详情，明确先保存再测试。"
     }
+  },
+  "CloudSubscribe": {
+    "name": "网盘订阅助手",
+    "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。（自用 fork）",
+    "labels": "订阅,网盘,转存,搜索,通知,刮削,签到",
+    "version": "3.0.0",
+    "icon": "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png",
+    "author": "zcs19960929",
+    "level": 1,
+    "release": true,
+    "v3": true,
+    "system_version": ">=3.0.0",
+    "history": {
+      "v3.0.0": "基于上游 v1.7.11 fork；修复整理落点缺少一级分类（电影/电视剧）的问题"
+    }
   }
 }
