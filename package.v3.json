@@ -1,13 +1,14 @@
 {
   "MetaTubeScraper": {
     "name": "MetaTube 番号刮削",
-    "version": "1.4.5",
+    "version": "1.4.6",
     "icon": "https://github.com/metatube-community.png",
-    "author": "zhangchangsheng",
+    "author": "zcs19960929",
     "level": 1,
     "release": true,
     "v3": true,
     "history": {
+      "v1.4.6": "补充插件作者与主页，修正作者头像不显示",
       "v1.4.5": "支持下载站排序号粘在字母番号前，`1KRMV-279` 可识别；`1CD-01`、`1DVD-02`、`1HD-720P` 等分段与画质标记仍被排除。",
       "v1.4.4": "修复文件名带 DV 前缀的番号被当成画质词过滤：DV-1149、[LTX]DV-1363、含 (53dv01110) 等水印写法都可识别为 DV-xxxx。",
       "v1.4.3": "新增插件页「清理缓存数据」按钮：一键删除指向已不存在文件的输出登记、清掉未完成的迁移与改名日志、清空增量扫描进度，无需手工改数据库；可选完全重置登记库并自动备份到 maintenance-backups。",
@@ -35,7 +36,7 @@
     "name": "网盘订阅助手",
     "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。（自用 fork）",
     "labels": "订阅,网盘,转存,搜索,通知,刮削,签到",
-    "version": "3.0.0",
+    "version": "3.0.1",
     "icon": "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "zcs19960929",
     "level": 1,
@@ -43,6 +44,7 @@
     "v3": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.0.1": "修正插件作者与主页为 zcs19960929，使作者头像正常显示",
       "v3.0.0": "基于上游 v1.7.11 fork；修复整理落点缺少一级分类（电影/电视剧）的问题"
     }
   }
