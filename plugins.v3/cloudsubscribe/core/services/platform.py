@@ -1552,6 +1552,7 @@ class PlatformIntegrationService(OwnerDelegator):
                 and (not title_key or title_key not in detected_keys)
         ):
             results = []
+            pending_titles = []
             for item in detected:
                 item_result = self.submit_platform_links(
                     subscribe_id=subscribe_id,
@@ -1564,17 +1565,40 @@ class PlatformIntegrationService(OwnerDelegator):
                     detect_multiple=False,
                 )
                 results.append(item_result)
-            success = all(bool(item.get("success")) for item in results)
-            messages = [str(item.get("message") or "") for item in results]
+                if isinstance(item_result, dict):
+                    item_data = item_result.get("data")
+                    if isinstance(item_data, dict) and item_data.get("selection_required"):
+                        pending_titles.append(str(item.get("title") or "").strip())
+
+            # 只识别出一个媒体时保持原有交互，便于正常弹出候选项
+            if len(results) == 1:
+                return results[0]
+
+            media_list: List[Dict[str, Any]] = []
+            messages = []
+            valid_results = [item for item in results if isinstance(item, dict)]
+            for item_result in valid_results:
+                message = str(item_result.get("message") or "").strip()
+                if message:
+                    messages.append(message)
+                item_data = item_result.get("data")
+                media = item_data.get("media") if isinstance(item_data, dict) else None
+                if isinstance(media, dict) and media:
+                    media_list.append(dict(media))
+            if pending_titles:
+                messages.append(
+                    "以下媒体匹配到多个候选，请单独发送其分享链接后再选择："
+                    + "、".join(title for title in pending_titles if title)
+                )
+            success = bool(valid_results) and all(
+                bool(item.get("success")) for item in valid_results
+            )
             return {
                 "success": success,
-                "message": "；".join(value for value in messages if value)
+                "message": "；".join(messages)
                            or ("多媒体资源已提交" if success else "部分媒体提交失败"),
                 "data": {
-                    "media": [
-                        dict((item.get("data") or {}).get("media") or {})
-                        for item in results
-                    ],
+                    "media": media_list,
                     "results": results,
                 },
             }

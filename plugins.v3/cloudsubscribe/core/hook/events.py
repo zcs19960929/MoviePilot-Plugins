@@ -415,8 +415,19 @@ class PluginEventHandler(OwnerDelegator):
             data = {}
         if not data.get("selection_required"):
             lines = [str(result.get("message") or "资源提交失败")]
-            media = data.get("media")
-            if isinstance(media, dict) and media:
+            # 单媒体时 data["media"] 是 dict；一个分享拆成多个媒体时是 list。
+            raw_media = data.get("media")
+            if isinstance(raw_media, dict):
+                media_items = [raw_media]
+            elif isinstance(raw_media, list):
+                media_items = [item for item in raw_media if isinstance(item, dict)]
+            else:
+                media_items = []
+            raw_results = data.get("results")
+            results = raw_results if isinstance(raw_results, list) else []
+            for index, media in enumerate(media_items[:10]):
+                if not media:
+                    continue
                 media_type = {
                     "movie": "电影",
                     "tv": "电视剧",
@@ -435,10 +446,17 @@ class PluginEventHandler(OwnerDelegator):
                     " · " + "/".join(f"S{value:02d}" for value in sorted(set(seasons)))
                     if seasons else ""
                 )
+                prefix = f"{index + 1}. " if len(media_items) > 1 else ""
                 lines.append(
-                    f"已识别：{media.get('title') or '未知媒体'}{year} · "
+                    f"{prefix}已识别：{media.get('title') or '未知媒体'}{year} · "
                     f"{media_type}{season}"
                 )
+                if len(results) > index:
+                    item = results[index]
+                    if isinstance(item, dict) and not item.get("success"):
+                        reason = str(item.get("message") or "提交失败").strip()
+                        if reason:
+                            lines.append(f"   └ {reason}")
             return "\n".join(lines)
         lines = [str(result.get("message") or "请选择 TMDB 媒体")]
         candidates = data.get("candidates")

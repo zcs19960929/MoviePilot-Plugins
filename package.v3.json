@@ -36,7 +36,7 @@
     "name": "网盘订阅助手",
     "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。（自用 fork）",
     "labels": "订阅,网盘,转存,搜索,通知,刮削,签到",
-    "version": "3.0.2",
+    "version": "3.0.3",
     "icon": "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "zcs19960929",
     "level": 1,
@@ -44,6 +44,7 @@
     "v3": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.0.3": "支持一个分享链接包含多个不同媒体：按文件名分组识别后分别转存，并汇总展示每部结果",
       "v3.0.2": "修复多文件分享链接导致 Telegram 处理线程崩溃、机器人无响应的问题",
       "v3.0.1": "修正插件作者与主页为 zcs19960929，使作者头像正常显示",
       "v3.0.0": "基于上游 v1.7.11 fork；修复整理落点缺少一级分类（电影/电视剧）的问题"
