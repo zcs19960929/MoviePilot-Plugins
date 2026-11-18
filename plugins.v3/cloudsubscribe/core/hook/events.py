@@ -351,6 +351,9 @@ class PluginEventHandler(OwnerDelegator):
                 selection_id=selection_id,
                 tmdb_id=tmdb_id,
                 selection_scope=self._command_selection_scope(event_data),
+                # 等待同步链真正跑完，才能把「转存了哪几集 / 为什么没转」告诉用户，
+                # 而不是只回一句「任务已提交」。
+                wait=True,
             )
         except Exception as error:
             logger.error(f"Telegram 资源提交异常：{error}", exc_info=True)
@@ -414,7 +417,6 @@ class PluginEventHandler(OwnerDelegator):
         if not isinstance(data, dict):
             data = {}
         if not data.get("selection_required"):
-            lines = [str(result.get("message") or "资源提交失败")]
             # 单媒体时 data["media"] 是 dict；一个分享拆成多个媒体时是 list。
             raw_media = data.get("media")
             if isinstance(raw_media, dict):
@@ -425,6 +427,11 @@ class PluginEventHandler(OwnerDelegator):
                 media_items = []
             raw_results = data.get("results")
             results = raw_results if isinstance(raw_results, list) else []
+            multi = len(media_items) > 1
+            # 多媒体时不重复同一句汇总，把结果放到各自条目下，便于逐条对照
+            lines: list = [] if multi else [
+                str(result.get("message") or "资源提交失败")
+            ]
             for index, media in enumerate(media_items[:10]):
                 if not media:
                     continue
@@ -446,17 +453,24 @@ class PluginEventHandler(OwnerDelegator):
                     " · " + "/".join(f"S{value:02d}" for value in sorted(set(seasons)))
                     if seasons else ""
                 )
-                prefix = f"{index + 1}. " if len(media_items) > 1 else ""
+                title_text = (
+                    f"{media.get('title') or '未知媒体'}{year} · {media_type}{season}"
+                )
                 lines.append(
-                    f"{prefix}已识别：{media.get('title') or '未知媒体'}{year} · "
-                    f"{media_type}{season}"
+                    f"{index + 1}. {title_text}" if multi
+                    else f"已识别：{title_text}"
                 )
                 if len(results) > index:
                     item = results[index]
-                    if isinstance(item, dict) and not item.get("success"):
-                        reason = str(item.get("message") or "提交失败").strip()
-                        if reason:
-                            lines.append(f"   └ {reason}")
+                    if not isinstance(item, dict):
+                        continue
+                    reason = str(item.get("message") or "").strip()
+                    if not item.get("success"):
+                        lines.append(f"   └ ❌ {reason or '提交失败'}")
+                    elif multi and reason:
+                        lines.append(f"   └ {reason}")
+            if not lines:
+                lines = ["未从分享内容识别到媒体信息"]
             return "\n".join(lines)
         lines = [str(result.get("message") or "请选择 TMDB 媒体")]
         candidates = data.get("candidates")

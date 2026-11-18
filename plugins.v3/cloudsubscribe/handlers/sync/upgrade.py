@@ -282,7 +282,7 @@ class UpgradeService(OwnerDelegator):
                                 subscribe,
                                 season,
                                 pending_episodes,
-                                require_media_match=is_cross_batch,
+                                require_media_match=True,
                             ) if preview_files else {}
                             preview_candidates = [
                                 (episode, file_item, score)
@@ -489,7 +489,7 @@ class UpgradeService(OwnerDelegator):
                         subscribe,
                         season,
                         pending_episodes,
-                        require_media_match=is_cross_batch,
+                        require_media_match=True,
                     )
                     upgrade_skip_episodes: List[int] = []
                     upgrade_skip_reason = ""

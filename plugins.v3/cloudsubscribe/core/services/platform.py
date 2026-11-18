@@ -1592,6 +1592,10 @@ class PlatformIntegrationService(OwnerDelegator):
                     "以下媒体匹配到多个候选，请单独发送其分享链接后再选择："
                     + "、".join(title for title in pending_titles if title)
                 )
+            # 多部媒体可能返回完全相同的提示，去重后再拼给用户看
+            messages = list(dict.fromkeys(
+                message for message in messages if message
+            ))
             success = bool(valid_results) and all(
                 bool(item.get("success")) for item in valid_results
             )
@@ -1800,7 +1804,9 @@ class PlatformIntegrationService(OwnerDelegator):
         pattern = re.compile(
             r"(?<![A-Za-z0-9])(?:S(?:eason)?\s*|第\s*)0*(\d{1,3})"
             r"(?:\s*(?:[-~～至到])\s*(?:S(?:eason)?\s*|第\s*)?0*(\d{1,3}))?"
-            r"(?:\s*季)?(?=$|[\s._/\\\-\[\]()Eｅ集])",
+            # 尾部不能是「集」：既排除紧跟的「集」，也排除「数字 + 空格 + 集」，
+            # 否则「第 19 集」会被当成第 19 季，26 集的分享会被识别成 S01-S26。
+            r"(?:\s*季)?(?=$|[\s._/\\\-\[\]()Eｅ])(?!\s*集)",
             re.IGNORECASE,
         )
         for match in pattern.finditer(str(value or "")):

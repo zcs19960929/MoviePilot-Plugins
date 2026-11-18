@@ -546,7 +546,9 @@ class TelevisionSyncProcessor(OwnerDelegator):
                             subscribe,
                             season,
                             episodes_to_match,
-                            require_media_match=is_cross_batch,
+                            # 始终校验文件名里的剧名：一个分享可能同时装多部剧，
+                            # 只按集数匹配会把 A 剧的第 190 集错当成 B 剧的第 190 集。
+                            require_media_match=True,
                         )
 
                         matched_pairs = []
