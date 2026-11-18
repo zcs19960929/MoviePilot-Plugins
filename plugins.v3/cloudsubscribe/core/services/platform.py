@@ -1467,6 +1467,7 @@ class PlatformIntegrationService(OwnerDelegator):
             tmdb_id: Optional[int] = None,
             selection_scope: str = "",
             detect_multiple: bool = True,
+            auto_select_first: bool = False,
     ) -> Dict[str, Any]:
         """提交链接；无有效订阅时先完成 TMDB 快速识别与选择。"""
         try:
@@ -1563,6 +1564,7 @@ class PlatformIntegrationService(OwnerDelegator):
                     seasons=list(item.get("seasons") or []),
                     selection_scope=selection_scope,
                     detect_multiple=False,
+                    auto_select_first=True,
                 )
                 results.append(item_result)
                 if isinstance(item_result, dict):
@@ -1604,32 +1606,33 @@ class PlatformIntegrationService(OwnerDelegator):
             }
 
         if selected_candidate is None:
-            preview = detected[0] if detected else self._preview_link_media(links)
-            link_title = str(preview.get("title") or "").strip()
-            if link_title:
-                recognized_title = link_title
-                if preview.get("year") and str(preview["year"]) not in recognized_title:
-                    recognized_title = f"{recognized_title} ({preview['year']})"
-                if not media_type:
-                    media_type = str(preview.get("media_type") or "")
-                if season is None:
-                    season = preview.get("season")
-                    if season is None and preview.get("seasons"):
-                        try:
-                            season = next(iter(sorted(preview["seasons"])))
-                        except (TypeError, ValueError, StopIteration):
-                            season = None
-                if not normalized_seasons and preview.get("seasons"):
-                    normalized_seasons = sorted({
-                        int(value) for value in preview["seasons"] if int(value) > 0
-                    })
-                if str(title or "").strip() and str(title or "").strip() != recognized_title:
-                    logger.info(
-                        f"分享内容识别到有效媒体，优先采用链接内容：'{recognized_title}'"
-                        f"（忽略消息附带文本 '{str(title).strip()}'）"
-                    )
+            requested_title = str(title or "").strip()
+            if requested_title:
+                # 调用方显式指定标题（多媒体拆分时逐项提交），必须以此为准，
+                # 否则会被分享里出现次数最多的第一部媒体覆盖。
+                recognized_title = requested_title
             else:
-                recognized_title = str(title or "").strip() or self._link_media_title(links)
+                preview = detected[0] if detected else self._preview_link_media(links)
+                link_title = str(preview.get("title") or "").strip()
+                if link_title:
+                    recognized_title = link_title
+                    if preview.get("year") and str(preview["year"]) not in recognized_title:
+                        recognized_title = f"{recognized_title} ({preview['year']})"
+                    if not media_type:
+                        media_type = str(preview.get("media_type") or "")
+                    if season is None:
+                        season = preview.get("season")
+                        if season is None and preview.get("seasons"):
+                            try:
+                                season = next(iter(sorted(preview["seasons"])))
+                            except (TypeError, ValueError, StopIteration):
+                                season = None
+                    if not normalized_seasons and preview.get("seasons"):
+                        normalized_seasons = sorted({
+                            int(value) for value in preview["seasons"] if int(value) > 0
+                        })
+                else:
+                    recognized_title = self._link_media_title(links)
 
             if not recognized_title:
                 return {
@@ -1696,6 +1699,16 @@ class PlatformIntegrationService(OwnerDelegator):
                     return {"success": False, "message": "指定 TMDB ID 与识别结果不匹配"}
             elif len(candidates) == 1:
                 selected_candidate = candidates[0]
+            elif auto_select_first:
+                # 一个分享拆成多部媒体时，无法在一次对话里为每部弹候选按钮，
+                # 直接取 TMDB 搜索首项（通常是最佳匹配），并在结果里标注实际选择。
+                selected_candidate = candidates[0]
+                logger.info(
+                    f"多媒体拆分自动选择：'{recognized_title}' -> "
+                    f"{selected_candidate.get('title')}"
+                    f"({selected_candidate.get('year') or '未知年份'})"
+                    f" tmdb={selected_candidate.get('tmdb_id')}"
+                )
             else:
                 next_selection_id = uuid4().hex[:12]
                 self._link_selection_cache[next_selection_id] = {
