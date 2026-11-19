@@ -63,7 +63,22 @@ class FileMatcher:
         }
         candidate_year = str(getattr(meta, "year", None) or "").strip()
         if candidate_year and expected_years and candidate_year not in expected_years:
-            return False
+            # 连载剧的发布文件常标注最新年份（如 2023 年开播的剧，2026 年的单集
+            # 文件写着 2026），而 TMDB 记录的是首播年，严格相等会把正片全部误杀。
+            # 剧集允许候选年份比期望年份晚 0-3 年；电影仍要求年份一致。
+            newer_year_ok = False
+            if season is not None:
+                try:
+                    candidate_value = int(candidate_year)
+                    newer_year_ok = any(
+                        0 <= candidate_value - int(expected) <= 3
+                        for expected in expected_years
+                        if str(expected).strip().isdigit()
+                    )
+                except (TypeError, ValueError):
+                    newer_year_ok = False
+            if not newer_year_ok:
+                return False
         candidate_type = getattr(meta, "type", None)
         expected_type = getattr(mediainfo, "type", None)
         if candidate_type and expected_type:
