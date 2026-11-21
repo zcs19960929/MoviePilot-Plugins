@@ -97,6 +97,20 @@ class MoviePilotRegistration(OwnerDelegator):
                 "auth": "bear",
             },
             {
+                "path": "/strm/scan",
+                "endpoint": self.api_vue_strm_scan,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "预检指定网盘目录的 STRM 状态",
+            },
+            {
+                "path": "/strm/rebuild",
+                "endpoint": self.api_vue_strm_rebuild,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "按网盘目录重建 STRM",
+            },
+            {
                 "path": "/overview",
                 "endpoint": self.api_platform_overview,
                 "methods": ["GET"],

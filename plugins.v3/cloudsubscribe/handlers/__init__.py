@@ -5,10 +5,11 @@
 from .notification import MediaServerNotifier, WebhookHandler
 from .search import SearchHandler
 from .subscription import SubscribeHandler
-from .sync import SyncHandler
+from .sync import StrmRebuildService, SyncHandler
 
 __all__ = [
     "SearchHandler",
+    "StrmRebuildService",
     "SyncHandler",
     "SubscribeHandler",
     "WebhookHandler",

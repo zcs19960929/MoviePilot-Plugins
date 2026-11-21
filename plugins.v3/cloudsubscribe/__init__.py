@@ -36,6 +36,7 @@ from .core.api import (
     QRCodeService,
     RuntimeApi,
     SearchApi,
+    StrmMaintenanceApi,
     StrmProxyApi,
     StrmProxyServer,
     SyncApi,
@@ -52,7 +53,7 @@ from .core.services import (
 from .core.storage import CloudSubscribeDataStore
 from .core.subscribe import AutoSubscribeService
 from .drive.scanner import DriverRegistry
-from .handlers import SearchHandler, SyncHandler, SubscribeHandler, WebhookHandler
+from .handlers import SearchHandler, StrmRebuildService, SyncHandler, SubscribeHandler, WebhookHandler
 from .search.scanner import SearchSourceRegistry
 from .subscribe import (  # noqa: F401 - 导入即注册自动订阅渠道
     create_anilist_provider,
@@ -83,6 +84,7 @@ _COMPONENT_TYPES = (
     RuntimeApi,
     MediaLibraryApi,
     StrmProxyApi,
+    StrmMaintenanceApi,
     QRCodeService,
     HistoryApi,
     MessageRoutingHook,
@@ -109,7 +111,7 @@ class CloudSubscribe(_PluginBase):
     # 插件图标
     plugin_icon = "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png"
     # 插件版本
-    plugin_version = "3.0.6"
+    plugin_version = "3.0.7"
     # 插件作者
     plugin_author = "zcs19960929"
     # 作者主页
@@ -949,6 +951,7 @@ class CloudSubscribe(_PluginBase):
         self._init_subscribe_handler()
         self._search_handler = SearchHandler(plugin=self)
         self._sync_handler = SyncHandler(plugin=self)
+        self._strm_rebuild_service = StrmRebuildService(self._sync_handler)
 
         self._webhook_handler = WebhookHandler(
             enabled=self._webhook_enabled,

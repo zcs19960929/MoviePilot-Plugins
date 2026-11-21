@@ -36,7 +36,7 @@
     "name": "网盘订阅助手",
     "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。（自用 fork）",
     "labels": "订阅,网盘,转存,搜索,通知,刮削,签到",
-    "version": "3.0.6",
+    "version": "3.0.7",
     "icon": "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "zcs19960929",
     "level": 1,
@@ -44,6 +44,7 @@
     "v3": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.0.7": "新增按网盘目录重建 STRM：可预检与执行，补缺失并修正内容过期（模板/域名变更后一次性修复）；/strm/scan 与 /strm/rebuild 接口",
       "v3.0.6": "修复连载剧年份漂移导致正片被误拒：剧集允许发布年份比 TMDB 首播年晚 0-3 年，电影仍严格校验",
       "v3.0.5": "转存结果实时反馈；修复同盘错配剧集、季数误识别（第N集被当成第N季）、多媒体结果重复展示",
       "v3.0.4": "多媒体拆分：显式标题不再被首部媒体覆盖，多候选时自动取 TMDB 首项并在结果中标注",
