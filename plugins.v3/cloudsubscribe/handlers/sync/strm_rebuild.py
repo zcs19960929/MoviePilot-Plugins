@@ -57,6 +57,12 @@ class StrmRebuildService(OwnerDelegator):
         if not directories:
             return [], 0
         depth_limit = self._MAX_DEPTH if max_depth is None else int(max_depth)
+        # 目录缓存可能停留在旧快照（转存补齐后新增的文件看不到），
+        # 重建前先失效，否则大目录只会处理到缓存时的前一批文件。
+        try:
+            directories.refresh_directories()
+        except Exception as error:  # noqa: BLE001 - 刷新失败不应阻断重建
+            logger.warning(f"重建 STRM：刷新目录缓存失败，继续使用现有缓存 - {error}")
         collected: List[Tuple[str, CloudFile]] = []
         failed_dirs = 0
         stack: List[Tuple[str, int]] = [(cloud_path.rstrip("/") or "/", 0)]
@@ -113,7 +119,7 @@ class StrmRebuildService(OwnerDelegator):
 
     @staticmethod
     def _classify(strm_path: Path, expected_content: str) -> str:
-        """返回 missing / empty / stale / ok。"""
+        """返回 missing / empty / stale / ok / unreadable。"""
         if not strm_path.is_file():
             return "missing"
         try:
@@ -121,7 +127,9 @@ class StrmRebuildService(OwnerDelegator):
                 return "empty"
             existing = strm_path.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
-            return "stale"
+            # 读不到内容不等于内容过期（可能是临时 I/O 失败或占用），
+            # 单独归类，避免被当成 stale 反复重写。
+            return "unreadable"
         if existing.strip() != str(expected_content).strip():
             return "stale"
         return "ok"
@@ -231,11 +239,14 @@ class StrmRebuildService(OwnerDelegator):
                     )
             pending = stats["missing"] + stats["empty"] + stats["stale"]
             stats["pending"] = pending
+            unreadable = int(stats.get("unreadable", 0) or 0)
             stats["message"] = (
                 f"{'预演完成' if dry_run else '重建完成'}："
                 f"扫描 {stats['scanned']}，缺失 {stats['missing']}，"
                 f"空文件 {stats['empty']}，过期 {stats['stale']}，"
-                f"正常 {stats['ok']}，"
+                f"正常 {stats['ok']}"
+                + (f"，读取失败 {unreadable}" if unreadable else "")
+                + "，"
                 + (
                     f"待写入 {pending}"
                     if dry_run
