@@ -4,6 +4,7 @@ from .account import AccountApi
 from .checkin import CheckinApi
 from .config import ConfigApi
 from .history import HistoryApi
+from .media_images import MediaImageApi
 from .media_library import MediaLibraryApi
 from .page import PageApi
 from .qrcode import QRCodeService
@@ -19,6 +20,7 @@ __all__ = [
     "CheckinApi",
     "ConfigApi",
     "HistoryApi",
+    "MediaImageApi",
     "MediaLibraryApi",
     "MoviePilotRegistration",
     "PageApi",

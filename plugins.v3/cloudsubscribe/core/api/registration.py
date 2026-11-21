@@ -111,6 +111,13 @@ class MoviePilotRegistration(OwnerDelegator):
                 "summary": "按网盘目录重建 STRM",
             },
             {
+                "path": "/media/refresh_images",
+                "endpoint": self.api_media_refresh_images,
+                "methods": ["POST"],
+                "auth": "bear",
+                "summary": "为缺图节目补齐 TMDB 图片",
+            },
+            {
                 "path": "/overview",
                 "endpoint": self.api_platform_overview,
                 "methods": ["GET"],

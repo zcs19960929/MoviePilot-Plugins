@@ -36,7 +36,7 @@
     "name": "网盘订阅助手",
     "description": "整合网盘能力与多渠道资源搜索，自动查找并补充订阅缺失的影视内容。（自用 fork）",
     "labels": "订阅,网盘,转存,搜索,通知,刮削,签到",
-    "version": "3.0.9",
+    "version": "3.1.0",
     "icon": "https://raw.githubusercontent.com/zcs19960929/MoviePilot-Plugins/main/icons/cloud.png",
     "author": "zcs19960929",
     "level": 1,
@@ -44,6 +44,7 @@
     "v3": true,
     "system_version": ">=3.0.0",
     "history": {
+      "v3.1.0": "新增按目录补齐节目图片：遍历本地剧集目录，按「标题 (年份)」识别 TMDB，为缺 poster/fanart 的节目下载图片；支持 offset/limit 分批",
       "v3.0.9": "重建 STRM 前失效目录缓存（否则补集后只能看到旧快照）；读取失败不再误判为过期，改记 unreadable",
       "v3.0.8": "修复重建任务标志泄漏：改用时间戳判定，请求被中断后不再永久占用；单目录重建实测 185 集耗时约 2 秒",
       "v3.0.7": "新增按网盘目录重建 STRM：可预检与执行，补缺失并修正内容过期（模板/域名变更后一次性修复）；/strm/scan 与 /strm/rebuild 接口",
