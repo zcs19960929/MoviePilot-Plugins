@@ -5,6 +5,7 @@
 本地 STRM。用于「模板或域名变更后批量修正」「历史缺失补齐」等维护场景。
 """
 from pathlib import Path
+import time
 from typing import Any, Dict, List, Tuple
 
 from app.log import logger
@@ -146,7 +147,10 @@ class StrmRebuildService(OwnerDelegator):
         reason = self._validate(cloud_path)
         if reason:
             return {"success": False, "message": reason}
-        if getattr(self, "_strm_rebuilding", False):
+        # 用时间戳而非布尔标志：请求被客户端中断时 finally 可能来不及执行，
+        # 布尔标志会永久卡住后续请求；超过 30 分钟视为上次任务已失效。
+        started_at = float(getattr(self, "_strm_rebuild_started_at", 0) or 0)
+        if started_at and (time.time() - started_at) < 1800:
             return {"success": False, "message": "已有重建任务正在执行，请稍后再试"}
 
         try:
@@ -154,7 +158,7 @@ class StrmRebuildService(OwnerDelegator):
         except (TypeError, ValueError):
             limit = 5000
         normalized_path = str(cloud_path).strip().rstrip("/") or "/"
-        self._strm_rebuilding = True
+        self._strm_rebuild_started_at = time.time()
         stats = {
             "success": True,
             "cloud_path": normalized_path,
@@ -241,4 +245,4 @@ class StrmRebuildService(OwnerDelegator):
             logger.info(f"重建 STRM 结果：{stats['message']}")
             return stats
         finally:
-            self._strm_rebuilding = False
+            self._strm_rebuild_started_at = 0
